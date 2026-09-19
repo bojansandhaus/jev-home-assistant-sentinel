@@ -5,7 +5,7 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 
-from .runtime import Case, OpenRouterJev, SentinelWorkflow
+from .runtime import Case, OpenRouterJev, SentinelWorkflow, redact
 from .runtime import verify as verify_observation
 
 DOMAIN = "jev_sentinel"
@@ -32,7 +32,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         decision = await hass.async_add_executor_job(workflow.review, case)
         hass.bus.async_fire(
             f"{DOMAIN}_decision",
-            {"case": case.to_dict(), "decision": decision.to_dict()},
+            redact({"case": case.to_dict(), "decision": decision.to_dict()}),
         )
 
     async def verify(call: ServiceCall) -> None:

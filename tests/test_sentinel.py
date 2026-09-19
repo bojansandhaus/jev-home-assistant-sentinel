@@ -106,6 +106,20 @@ def test_redact_handles_nested_values():
     assert value == {"nested": [{"password": "[REDACTED]"}], "safe": True}
 
 
+def test_redact_masks_credentials_in_provider_free_text():
+    value = redact("provider said token=do-not-send; keep this")
+    assert value == "provider said token=[REDACTED]; keep this"
+
+
+def test_home_assistant_event_payload_redacts_decision_free_text():
+    decision = _runtime.Decision(
+        "notify", "Ask user, api_key=do-not-send", raw={"token": "do-not-send"}
+    )
+    payload = _runtime.redact({"decision": decision.to_dict()})
+    assert "do-not-send" not in str(payload)
+    assert payload["decision"]["reason"] == "Ask user, api_key=[REDACTED]"
+
+
 def test_home_assistant_bridge_verifies_readback_without_package_install():
     assert integration_verify("off", "off")["status"] == "matched"
     assert integration_verify("off", "on")["next_step"] == "reopen_case"

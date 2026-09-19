@@ -52,16 +52,16 @@ natural language or sensor event
             ↓
    typed Jev recommendation
             ↓
-  deterministic policy check
+   policy context for a caller
             ↓
- Home Assistant service call
+   advisory decision event
             ↓
-       state readback
+ external approval, dispatch, and readback
             ↓
- confirmed, failed, or uncertain result
+confirmed, failed, or uncertain result
 ```
 
-The Home Assistant integration currently stops after review and event emission. A consumer must own approval, dispatch, and readback. The standalone `SentinelWorkflow.execute` method demonstrates the complete provider-neutral contract.
+The Home Assistant integration is shadow-only. It stops after review and event emission. It supplies policy context but does not apply authorization, dispatch a Home Assistant service, or read state back. A consumer must own those steps. The standalone `SentinelWorkflow.execute` method exposes the complete provider-neutral contract.
 
 ## Installation
 
@@ -159,7 +159,7 @@ The Home Assistant adapter is fixed to the OpenRouter endpoint and `typesafe/jev
 
 ### Where is my API key stored?
 
-The config flow stores it in the Home Assistant config entry. The provider request uses an authorization header. Redaction also masks credential-shaped case fields before a provider request.
+The config flow stores it in the Home Assistant config entry. The provider request uses an authorization header. Redaction masks credential-shaped case fields and matching credential text before provider submission and decision event emission.
 
 ### Does it work with automations?
 

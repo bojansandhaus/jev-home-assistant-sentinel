@@ -152,7 +152,7 @@ The handler fires `jev_sentinel_verification` with the verification dictionary.
 
 ## Status sensor
 
-Each config entry creates `sensor.<entry_name>_status` with unique ID `jev_sentinel_status`. Its initial native value is `ready`. It listens for `jev_sentinel_decision` and updates to `event.data["decision"]["outcome"]`, falling back to `unknown` when absent. It does not listen for verification events.
+Each config entry creates `sensor.<entry_name>_status` with unique ID `jev_sentinel_status`. Its initial native value is `ready`. It listens for `jev_sentinel_decision` and updates to `event.data["decision"]["outcome"]`, falling back to `unknown` when absent. It also listens for `jev_sentinel_verification` and updates to that event's `status`.
 
 ## Configuration
 

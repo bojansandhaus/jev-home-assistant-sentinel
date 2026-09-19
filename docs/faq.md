@@ -63,7 +63,7 @@ The config flow accepts `shadow`, defaulting to true. Current setup code does no
 
 ## Why is the status sensor still `ready`?
 
-The sensor starts at `ready` and updates only after `jev_sentinel_decision`. It listens for decision events, not verification events. Confirm the integration entry is loaded and inspect the event bus for the expected event.
+The sensor starts at `ready` and updates after `jev_sentinel_decision` or `jev_sentinel_verification`. Confirm the integration entry is loaded and inspect the event bus for the expected event.
 
 ## Which actions does the core allow?
 

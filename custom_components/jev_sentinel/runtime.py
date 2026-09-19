@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +19,9 @@ from urllib.request import Request, urlopen
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
+_SECRET_TEXT = re.compile(
+    r"(?i)(api[_ -]?key|token|password|secret|credential)(\s*[:=]\s*)[^\s,;]+"
+)
 
 
 def _now() -> str:
@@ -136,6 +140,8 @@ class OpenRouterJev:
 
 
 def redact(value: Any) -> Any:
+    if isinstance(value, str):
+        return _SECRET_TEXT.sub(r"\1\2[REDACTED]", value)
     if isinstance(value, dict):
         return {
             str(key): (
@@ -149,6 +155,8 @@ def redact(value: Any) -> Any:
             for key, item in value.items()
         }
     if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, tuple):
         return [redact(item) for item in value]
     return value
 
