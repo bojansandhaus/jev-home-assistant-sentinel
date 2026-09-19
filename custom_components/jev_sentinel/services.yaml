@@ -30,3 +30,7 @@ verify:
       required: true
       selector:
         text:
+    available:
+      default: true
+      selector:
+        boolean:

@@ -1,14 +1,10 @@
-"""Home Assistant entry point for Jev Home Sentinel."""
+"""Home Assistant entry point for Jev Home Assistant Sentinel."""
 from __future__ import annotations
 
-from typing import Any
-
-from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers import service
+from homeassistant.core import HomeAssistant, ServiceCall
 
-from sentinel import Case, SentinelWorkflow
-from sentinel.jev import OpenRouterJev
+from .runtime import Case, OpenRouterJev, SentinelWorkflow, verify as verify_observation
 
 DOMAIN = "jev_sentinel"
 PLATFORMS = ["sensor"]
@@ -32,7 +28,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.bus.async_fire(f"{DOMAIN}_decision", {"case": case.to_dict(), "decision": decision.to_dict()})
 
     async def verify(call: ServiceCall) -> None:
-        hass.bus.async_fire(f"{DOMAIN}_verification", {"expected": call.data.get("expected"), "actual": call.data.get("actual")})
+        expected = call.data.get("expected")
+        actual = call.data.get("actual")
+        result = verify_observation(expected, actual, available=call.data.get("available", True))
+        hass.bus.async_fire(f"{DOMAIN}_verification", result)
 
     if not hass.services.has_service(DOMAIN, "review"):
         hass.services.async_register(DOMAIN, "review", review)

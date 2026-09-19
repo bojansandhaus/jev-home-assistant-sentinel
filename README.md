@@ -1,48 +1,82 @@
-# Jev Home Sentinel
+<div align="center">
 
-Jev Home Sentinel is a Home Assistant integration and provider neutral Python core for turning natural language or sensor events into **bounded, verified decisions**.
+# Jev Home Assistant Sentinel
 
-It is the execution layer suggested by the command flow:
+**A safety boundary for Home Assistant decisions.**
+
+Jev interprets a bounded case. Sentinel applies policy. Home Assistant performs an allowed action. Sentinel reads the state back.
+
+[![CI](https://github.com/bojansandhaus/jev-home-assistant-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/bojansandhaus/jev-home-assistant-sentinel/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
+</div>
+
+## The short answer
+
+Jev Home Assistant Sentinel is a Home Assistant integration for AI assisted decisions with explicit policy checks and deterministic state verification.
+
+It can review an event such as a window left open while heating runs, recommend a safe response, and report whether the resulting Home Assistant state actually matches the expectation.
+
+It does not give an AI model unrestricted control of your house.
+
+## Why it exists
+
+The usual command flow ends with a green light and the words **command sent**. Physical systems do not work that way. A service call can succeed while a device remains unavailable, a target can resolve to the wrong entity, and a lock can report an unknown state after the network disappears.
+
+Sentinel carries the command across the gap between intention and evidence:
 
 ```text
-User request or Home Assistant event
-        ↓
-Jev interprets the bounded case
-        ↓
-Sentinel checks policy
-        ↓
-Home Assistant dispatches an allowlisted action
-        ↓
-Sentinel reads the state back
-        ↓
-confirmed, failed, or uncertain result
+Natural language or sensor event
+              ↓
+        Bounded Sentinel case
+              ↓
+        Typed Jev recommendation
+              ↓
+       Deterministic policy check
+              ↓
+     Home Assistant service call
+              ↓
+         State readback
+              ↓
+  confirmed, failed, or uncertain result
 ```
 
-The screenshot that inspired this project stops at **Command sent**. Sentinel continues to **State confirmed**. It keeps interpretation, authorization, execution, and verification separate.
+The distinction matters. **Command sent** is an observation. **State confirmed** is evidence.
 
 ## What it does
 
-The first release supports:
+- Sends bounded case state to Jev through OpenRouter.
+- Redacts credential shaped fields before a provider request.
+- Keeps Jev advisory rather than granting it execution authority.
+- Allows only explicitly listed actions.
+- Leaves sensitive actions behind an approval gate.
+- Separates dispatch success from device state confirmation.
+- Reopens the case when readback contradicts the expected state.
+- Reports unavailable devices as uncertain rather than successful.
+- Exposes Home Assistant services for review and verification.
+- Provides a status sensor for the latest decision outcome.
+- Includes a provider neutral Python core for agents and local tools.
 
-- Bounded Home Assistant cases
-- Typed Jev recommendations through OpenRouter
-- Redaction of credentials before provider calls
-- An explicit allowlist for reversible actions
-- Approval gates for sensitive actions
-- Deterministic state readback
-- Structured failure and uncertainty results
-- Home Assistant services for `review` and `verify`
-- A status sensor for the latest Jev outcome
+The Home Assistant review service runs in shadow mode. It creates a typed recommendation and fires an event. It does not silently operate a device.
 
-The default behavior is advisory. The `review` service asks Jev for a recommendation and fires an event. It does not execute the recommended device action. Execution is available through the provider neutral core only after the caller supplies an allowlisted dispatcher and a readback function.
+## Install in Home Assistant
 
-## Install the Home Assistant integration
+Download or clone this repository. Copy `custom_components/jev_sentinel` into the `custom_components` directory of your Home Assistant configuration:
 
-Copy `custom_components/jev_sentinel` into the `custom_components` directory of your Home Assistant configuration, restart Home Assistant, then add **Jev Home Sentinel** from Settings, Devices and services.
+```text
+/config/custom_components/jev_sentinel/
+```
 
-The config flow stores the OpenRouter key in the Home Assistant config entry. Do not put a real key in YAML, Git, examples, or issue reports.
+Restart Home Assistant. Open **Settings**, **Devices and services**, choose **Add integration**, and search for **Jev Home Assistant Sentinel**.
 
-## Example service call
+The config flow stores the OpenRouter key in the Home Assistant config entry. Keep keys out of YAML, Git, screenshots, issue reports, and logs.
+
+The integration carries its small runtime bridge inside the custom component. It does not require a private Hermes installation or a package import from the source checkout.
+
+## Review a case
+
+Call the Home Assistant service with the smallest useful set of facts:
 
 ```yaml
 service: jev_sentinel.review
@@ -58,9 +92,27 @@ data:
     expected_state: off
 ```
 
-Listen for `jev_sentinel_decision` to receive the structured recommendation. A consumer can then apply its own deterministic policy and user approval rules.
+The integration emits `jev_sentinel_decision`. A consumer can apply local policy, ask the user for approval, and then dispatch an allowlisted Home Assistant action.
+
+## Verify a result
+
+Use the verification service when a command has a known expected state and a readback value:
+
+```yaml
+service: jev_sentinel.verify
+data:
+  expected: "off"
+  actual: "off"
+  available: true
+```
+
+A matching readback produces `matched` and `close_case`. A mismatch produces `mismatch` and `reopen_case`. An unavailable target produces `unavailable` and `notify_and_retry`.
+
+The service never turns an unavailable device into a success merely because the original command returned without an exception.
 
 ## Python core
+
+The core package works without Home Assistant:
 
 ```python
 from sentinel import Case, Decision, SentinelWorkflow
@@ -71,6 +123,7 @@ case = Case.create(
     entities=["light.lamp"],
     facts={"expected_state": "off"},
 )
+
 workflow = SentinelWorkflow(provider)
 decision = workflow.review(case)
 result = workflow.execute(
@@ -81,19 +134,31 @@ result = workflow.execute(
 )
 ```
 
-A successful dispatch is not treated as success until the readback matches the expected state. A mismatch returns `reopen_case`, not a cheerful false confirmation.
+A successful result contains separate records for the decision, authorization, dispatch, and verification. That structure makes the path inspectable and testable.
 
 ## Safety boundary
 
-- Jev is advisory, not execution authority.
-- Unknown actions are denied.
-- Sensitive actions need explicit approval.
-- Every executed action should have a readback.
-- Unavailable devices produce an uncertain result.
-- Provider input is bounded and credential values are redacted.
-- Shadow mode is the default for the Home Assistant service.
+Jev can recommend. It cannot authorize itself.
 
-This project does not replace Home Assistant authentication, user permissions, alarm controls, or safety systems.
+Sentinel denies unknown actions, keeps security sensitive operations behind approval, and requires a caller supplied readback for executed actions. Home Assistant authentication, user permissions, alarm controls, device safety rules, and emergency systems remain authoritative.
+
+The default policy allows a small set of reversible light, switch, climate, notification, and user question actions. It does not include arbitrary service calls, door unlocking, alarm disarming, or garage control.
+
+## Who is this for?
+
+**Home Assistant users** who want AI assisted triage without handing an agent the keys to every entity.
+
+**Automation authors** who need a typed recommendation before a workflow acts.
+
+**AI agent developers** who need a provider neutral policy and verification boundary around physical world actions.
+
+**Researchers and maintainers** who want observable outcomes instead of logs that only say a tool returned successfully.
+
+## What is Jev?
+
+Jev is TypeSafe's focused decision model. This project calls Jev through OpenRouter using bounded state and typed questions. Jev supplies a recommendation. It does not supply the final authority for a physical action.
+
+This repository is independent of TypeSafe, OpenRouter, and Hermes. The companion project [jev-decisions](https://github.com/bojansandhaus/jev-decisions) provides the general Jev decision layer for Hermes and other agents. Jev Home Assistant Sentinel supplies the Home Assistant boundary.
 
 ## Development
 
@@ -101,13 +166,38 @@ This project does not replace Home Assistant authentication, user permissions, a
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[test]'
-pytest
+python -m pytest
+python -m compileall -q sentinel custom_components tests
 ```
 
-The core tests run without a Home Assistant installation. The custom component is tested against Home Assistant's integration test matrix in CI before a public release. This initial checkout intentionally keeps the Home Assistant dependency out of the core package.
+The core suite runs without a Home Assistant installation. The custom component has a self contained runtime bridge, and its files are syntax checked in the build. Live Home Assistant validation should be performed in a test instance before enabling automation.
 
-## Relationship to Jev Decisions
+## Frequently asked questions
 
-`jev-decisions` is the general Jev decision layer for Hermes and other agents. This repository is the Home Assistant adapter and closed loop execution boundary. The two projects should remain separate so the Home Assistant integration can be installed without importing private Hermes modules.
+### Does Sentinel control Home Assistant automatically?
 
-Jev is TypeSafe's model, and OpenRouter provides the API used here. This is an independent community project.
+No. The review service is advisory and shadow only. A separate caller must apply local policy, approval, dispatch, and verification rules.
+
+### Does Sentinel replace Home Assistant Assist?
+
+No. Assist can remain the natural language front door. Sentinel can sit behind it as the typed decision, policy, and readback boundary.
+
+### Does Sentinel send my whole Home Assistant history to OpenRouter?
+
+No. The integration sends a bounded case. Credential shaped fields are redacted. The caller decides which entity facts belong in that case.
+
+### What happens when a device is unavailable?
+
+The result is uncertain. Sentinel reports the missing evidence and recommends notification or retry rather than claiming success.
+
+### Can I use the core without Home Assistant?
+
+Yes. The `sentinel` package accepts a decision provider, an action dispatcher, and a readback function. Home Assistant is one adapter, not a requirement of the policy contract.
+
+### Is this a security system?
+
+No. It is a decision and verification boundary. Do not use it as a substitute for certified safety equipment, alarm controls, emergency automation, or access control.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

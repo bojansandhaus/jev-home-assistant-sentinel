@@ -1,5 +1,16 @@
+import importlib.util
+import sys
+from pathlib import Path
+
 from sentinel import Case, Decision, Policy, SentinelWorkflow
 from sentinel.redaction import redact
+
+_runtime_spec = importlib.util.spec_from_file_location("jev_sentinel_runtime", Path(__file__).parents[1] / "custom_components/jev_sentinel/runtime.py")
+assert _runtime_spec and _runtime_spec.loader
+_runtime = importlib.util.module_from_spec(_runtime_spec)
+sys.modules[_runtime_spec.name] = _runtime
+_runtime_spec.loader.exec_module(_runtime)
+integration_verify = _runtime.verify
 
 
 class FakeProvider:
@@ -62,3 +73,8 @@ def test_failed_readback_reopens_case():
 def test_redact_handles_nested_values():
     value = redact({"nested": [{"password": "x"}], "safe": True})
     assert value == {"nested": [{"password": "[REDACTED]"}], "safe": True}
+
+
+def test_home_assistant_bridge_verifies_readback_without_package_install():
+    assert integration_verify("off", "off")["status"] == "matched"
+    assert integration_verify("off", "on")["next_step"] == "reopen_case"

@@ -1,9 +1,9 @@
 {
   "domain": "jev_sentinel",
-  "name": "Jev Home Sentinel",
+  "name": "Jev Home Assistant Sentinel",
   "version": "0.1.0",
-  "documentation": "https://github.com/bojansandhaus/jev-home-sentinel",
-  "issue_tracker": "https://github.com/bojansandhaus/jev-home-sentinel/issues",
+  "documentation": "https://github.com/bojansandhaus/jev-home-assistant-sentinel",
+  "issue_tracker": "https://github.com/bojansandhaus/jev-home-assistant-sentinel/issues",
   "codeowners": ["@bojansandhaus"],
   "config_flow": true,
   "iot_class": "cloud_polling",

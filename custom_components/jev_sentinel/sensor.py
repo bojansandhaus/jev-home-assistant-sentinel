@@ -19,7 +19,7 @@ class SentinelStatusSensor(SensorEntity):
     _attr_unique_id = "jev_sentinel_status"
 
     def __init__(self, entry: ConfigEntry) -> None:
-        self._attr_device_info = {"identifiers": {(DOMAIN, entry.entry_id)}, "name": "Jev Home Sentinel", "manufacturer": "Community"}
+        self._attr_device_info = {"identifiers": {(DOMAIN, entry.entry_id)}, "name": "Jev Home Assistant Sentinel", "manufacturer": "Community"}
         self._attr_native_value = "ready"
 
     async def async_added_to_hass(self) -> None:
