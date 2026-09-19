@@ -24,7 +24,14 @@ class SentinelStatusSensor(SensorEntity):
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self.hass.bus.async_listen("jev_sentinel_decision", self._decision_received))
+        self.async_on_remove(self.hass.bus.async_listen("jev_sentinel_verification", self._verification_received))
 
     async def _decision_received(self, event) -> None:
         self._attr_native_value = event.data.get("decision", {}).get("outcome", "unknown")
+        self._attr_extra_state_attributes = {"event": "decision", "action": event.data.get("decision", {}).get("action")}
+        self.async_write_ha_state()
+
+    async def _verification_received(self, event) -> None:
+        self._attr_native_value = event.data.get("status", "unknown")
+        self._attr_extra_state_attributes = {"event": "verification", "verified": event.data.get("verified", False), "next_step": event.data.get("next_step")}
         self.async_write_ha_state()

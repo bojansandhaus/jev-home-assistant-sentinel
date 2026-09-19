@@ -11,7 +11,10 @@ PLATFORMS = ["sensor"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry.data
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        **entry.data,
+        "shadow": entry.options.get("shadow", True),
+    }
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def review(call: ServiceCall) -> None:
@@ -42,4 +45,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    if unload_ok and not hass.data.get(DOMAIN):
+        hass.services.async_remove(DOMAIN, "review")
+        hass.services.async_remove(DOMAIN, "verify")
+        hass.data.pop(DOMAIN, None)
     return unload_ok

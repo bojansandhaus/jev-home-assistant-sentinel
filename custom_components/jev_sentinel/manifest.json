@@ -1,7 +1,8 @@
 {
   "domain": "jev_sentinel",
   "name": "Jev Home Assistant Sentinel",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "integration_type": "service",
   "documentation": "https://github.com/bojansandhaus/jev-home-assistant-sentinel",
   "issue_tracker": "https://github.com/bojansandhaus/jev-home-assistant-sentinel/issues",
   "codeowners": ["@bojansandhaus"],

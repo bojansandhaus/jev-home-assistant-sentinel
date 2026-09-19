@@ -25,11 +25,11 @@ verify:
     expected:
       required: true
       selector:
-        text:
+        object: {}
     actual:
       required: true
       selector:
-        text:
+        object: {}
     available:
       default: true
       selector:
