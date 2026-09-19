@@ -11,7 +11,8 @@ review:
         text:
     entities:
       selector:
-        object:
+        entity:
+          multiple: true
     facts:
       selector:
         object:
@@ -25,11 +26,11 @@ verify:
     expected:
       required: true
       selector:
-        object: {}
+        text:
     actual:
       required: true
       selector:
-        object: {}
+        text:
     available:
       default: true
       selector:

@@ -1,4 +1,5 @@
 """Redact household details before optional provider calls."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -12,7 +13,11 @@ def redact(value: Any) -> Any:
         result: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key).lower()
-            result[str(key)] = "[REDACTED]" if any(word in key_text for word in _SECRET_WORDS) else redact(item)
+            result[str(key)] = (
+                "[REDACTED]"
+                if any(word in key_text for word in _SECRET_WORDS)
+                else redact(item)
+            )
         return result
     if isinstance(value, list):
         return [redact(item) for item in value]

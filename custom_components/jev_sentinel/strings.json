@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Jev Home Assistant Sentinel",
+        "description": "Enter the OpenRouter API key used for Jev reviews.",
+        "data": {
+          "api_key": "OpenRouter API key"
+        }
+      }
+    },
+    "error": {}
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Sentinel options",
+        "description": "Sentinel remains advisory in v1.0.0. This option is retained for forward compatibility.",
+        "data": {
+          "shadow": "Shadow mode"
+        }
+      }
+    }
+  }
+}

@@ -139,7 +139,7 @@ Shadow mode creates a recommendation and leaves execution to a consumer. This is
 
 There is no shipped active Home Assistant mode. A future consumer could implement active execution by applying policy, recording approval, dispatching an allowlisted service, and reading state back. That consumer must define its retry, timeout, entity-targeting, and audit behavior before it is treated as active.
 
-The config flow exposes a `shadow` option, yet current setup code does not apply it. Do not use that option as evidence that active mode exists.
+The config flow exposes a `shadow` option, but the adapter remains shadow-only regardless of its value. Do not use that option as evidence that active mode exists.
 
 ## Safety and privacy
 

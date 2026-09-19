@@ -1,10 +1,12 @@
 """Home Assistant entry point for Jev Home Assistant Sentinel."""
+
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 
-from .runtime import Case, OpenRouterJev, SentinelWorkflow, verify as verify_observation
+from .runtime import Case, OpenRouterJev, SentinelWorkflow
+from .runtime import verify as verify_observation
 
 DOMAIN = "jev_sentinel"
 PLATFORMS = ["sensor"]
@@ -28,12 +30,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         provider = OpenRouterJev(entry.data.get("api_key"))
         workflow = SentinelWorkflow(provider)
         decision = await hass.async_add_executor_job(workflow.review, case)
-        hass.bus.async_fire(f"{DOMAIN}_decision", {"case": case.to_dict(), "decision": decision.to_dict()})
+        hass.bus.async_fire(
+            f"{DOMAIN}_decision",
+            {"case": case.to_dict(), "decision": decision.to_dict()},
+        )
 
     async def verify(call: ServiceCall) -> None:
         expected = call.data.get("expected")
         actual = call.data.get("actual")
-        result = verify_observation(expected, actual, available=call.data.get("available", True))
+        result = verify_observation(
+            expected, actual, available=call.data.get("available", True)
+        )
         hass.bus.async_fire(f"{DOMAIN}_verification", result)
 
     if not hass.services.has_service(DOMAIN, "review"):

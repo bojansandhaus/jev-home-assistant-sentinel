@@ -1,13 +1,14 @@
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).parents[1]
 
 
 def test_release_metadata_is_complete():
     hacs = json.loads((ROOT / "hacs.json").read_text())
-    manifest = json.loads((ROOT / "custom_components/jev_sentinel/manifest.json").read_text())
+    manifest = json.loads(
+        (ROOT / "custom_components/jev_sentinel/manifest.json").read_text()
+    )
     assert hacs == {
         "name": "Jev Home Assistant Sentinel",
         "render_readme": True,
@@ -36,5 +37,6 @@ def test_validation_workflows_use_official_actions():
 
 def test_service_schema_uses_structured_readback_values():
     schema = (ROOT / "custom_components/jev_sentinel/services.yaml").read_text()
-    assert "object: {}" in schema
+    assert "entity:" in schema
+    assert "multiple: true" in schema
     assert "jev_sentinel_verification" not in schema

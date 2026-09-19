@@ -46,7 +46,7 @@ python -m json.tool custom_components/jev_sentinel/manifest.json >/dev/null
 python -m json.tool hacs.json >/dev/null
 ```
 
-The current repository configuration does not declare Black or isort dependencies. When those tools are available in your environment, run:
+The test extra installs the required formatters in the isolated environment. Run:
 
 ```bash
 python -m black --check sentinel custom_components tests
@@ -62,14 +62,22 @@ The authoritative checks run in GitHub Actions:
 - `.github/workflows/hassfest.yaml` runs `home-assistant/actions/hassfest@master`.
 - `.github/workflows/validate.yaml` runs `hacs/action@main` with `category: integration`.
 
-There is no universally supported local Hassfest command in this repository. Use the official action in a pull request or a local Docker reproduction of that action when you need parity. HACS validation can likewise be run with the HACS action's documented container or through a test pull request. Do not report either check as passed until the action output exists.
+The authoritative Hassfest and HACS checks run in GitHub Actions. Locally, validate the same repository metadata before pushing:
+
+```bash
+python -m json.tool hacs.json >/dev/null
+python -m json.tool custom_components/jev_sentinel/manifest.json >/dev/null
+python -m compileall -q sentinel custom_components tests
+```
+
+Do not report Hassfest or HACS as passed until their official action output exists. Docker is optional locally; it is not required for the local Python validator commands above.
 
 ## Quality bar
 
 Every pull request must pass:
 
 - the Python test suite;
-- Black and isort checks when configured by CI;
+- Black and isort checks;
 - JSON validation for integration metadata;
 - Hassfest validation;
 - HACS validation;

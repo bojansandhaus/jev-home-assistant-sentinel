@@ -32,7 +32,7 @@ Install the repository as a HACS custom repository, choose **Integration**, rest
 
 This release runs in shadow mode only. The Home Assistant integration does not dispatch an action after a recommendation. It emits an event for a separate consumer to inspect, approve, dispatch, and verify. There is no built-in polling, delayed readback, durable decision ledger, local decision provider, or active execution consumer.
 
-The config flow exposes a `shadow` option, but current setup code does not apply the stored option. The runtime always marks decisions as shadow decisions. This is a source-level limitation of v1.0.0.
+The config flow exposes a `shadow` option, but the adapter remains shadow-only regardless of its value. The runtime always marks decisions as shadow decisions. This is a source-level limitation of v1.0.0.
 
 ### Future scope
 

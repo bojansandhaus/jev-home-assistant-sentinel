@@ -48,7 +48,7 @@ The Home Assistant component creates a case, calls `OpenRouterJev`, and fires ev
 
 The runtime asks for `outcome`, `action`, and `confidence`. Outcomes are constrained by the request to `ignore`, `notify`, `ask_user`, `recommend`, or `escalate`. Actions offered to Jev are `notify`, `ask_user`, `light.turn_off`, `switch.turn_off`, `climate.set_temperature`, and `none`. The runtime converts `none` to `action: null`.
 
-`shadow` is true in the runtime and core defaults. It is an observation flag, not an execution switch.
+`shadow` is true in the runtime and core defaults. `SentinelWorkflow.execute` refuses to dispatch a shadow decision and returns `authorization.status: shadow_only`. Only a caller-created non-shadow decision can enter the provider-neutral execution path.
 
 ## OpenRouter provider
 
@@ -121,7 +121,7 @@ The integration registers `jev_sentinel.review` and `jev_sentinel.verify` once p
 |---|---:|---|---|
 | `event_type` | yes | text | Case event name. |
 | `area` | no | text | Area label. |
-| `entities` | no | object | Entity identifiers or caller-provided value. |
+| `entities` | no | entity, multiple | Zero or more Home Assistant entity identifiers. |
 | `facts` | no | object | Bounded case facts. |
 | `requested_action` | no | text | Requested action label. |
 
@@ -131,8 +131,8 @@ The handler calls OpenRouter in an executor job and fires `jev_sentinel_decision
 
 | Field | Required | Selector | Meaning |
 |---|---:|---|---|
-| `expected` | yes | text | Expected readback value. |
-| `actual` | yes | text | Observed readback value. |
+| `expected` | yes | text | Expected value supplied by the caller. |
+| `actual` | yes | text | Observed value supplied by the caller. |
 | `available` | no | boolean | Defaults to true. |
 
 The handler fires `jev_sentinel_verification` with the verification dictionary.
@@ -156,7 +156,7 @@ Each config entry creates `sensor.<entry_name>_status` with unique ID `jev_senti
 
 ## Configuration
 
-The config flow stores a required `api_key` in the config entry. Its options flow accepts optional boolean `shadow`, default `true`. The current setup stores the options but does not read them in `async_setup_entry`; runtime decisions remain shadow decisions. Home Assistant version support is declared by the project target and should be validated against the actual manifest when packaging.
+The config flow stores a required `api_key` in the config entry. Its options flow accepts optional boolean `shadow`, default `true`. The Home Assistant adapter remains shadow-only regardless of that option. Home Assistant version support is declared by the project target and should be validated against the actual manifest when packaging.
 
 ## Provider-neutral core
 
@@ -167,12 +167,12 @@ class DecisionProvider(Protocol):
     def decide(self, state: dict[str, Any]) -> Decision: ...
 ```
 
-`review` passes a redacted case and sorted allowed actions to the provider. `execute` authorizes the action, calls `dispatch(action)` when allowed, catches dispatch failures, calls `readback()`, and records verification. It never hides an authorization or readback failure behind a successful dispatch record.
+`review` passes a redacted case and sorted allowed actions to the provider. `execute` rejects shadow decisions, authorizes non-shadow actions, calls `dispatch(action)` when allowed, catches dispatch failures, calls `readback()`, and records verification. It never hides an authorization or readback failure behind a successful dispatch record.
 
 ## Limitations
 
 - v1.0.0 has no active Home Assistant dispatch consumer.
 - The integration does not poll entities or implement delayed readback.
 - The OpenRouter adapter is the only shipped Home Assistant provider.
-- The config-flow `shadow` option is collected but not applied.
+- The config-flow `shadow` option cannot enable active Home Assistant execution.
 - Home Assistant event handlers do not retain a durable decision ledger.

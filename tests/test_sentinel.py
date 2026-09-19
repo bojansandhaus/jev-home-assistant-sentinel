@@ -5,7 +5,10 @@ from pathlib import Path
 from sentinel import Case, Decision, Policy, SentinelWorkflow
 from sentinel.redaction import redact
 
-_runtime_spec = importlib.util.spec_from_file_location("jev_sentinel_runtime", Path(__file__).parents[1] / "custom_components/jev_sentinel/runtime.py")
+_runtime_spec = importlib.util.spec_from_file_location(
+    "jev_sentinel_runtime",
+    Path(__file__).parents[1] / "custom_components/jev_sentinel/runtime.py",
+)
 assert _runtime_spec and _runtime_spec.loader
 _runtime = importlib.util.module_from_spec(_runtime_spec)
 sys.modules[_runtime_spec.name] = _runtime
@@ -24,7 +27,12 @@ class FakeProvider:
 
 
 def test_case_is_bounded_and_serializable():
-    case = Case.create("window_open_while_heating", area="living_room", entities=["climate.living_room"], facts={"expected_state": "off"})
+    case = Case.create(
+        "window_open_while_heating",
+        area="living_room",
+        entities=["climate.living_room"],
+        facts={"expected_state": "off"},
+    )
     payload = case.to_dict()
     assert payload["event_type"] == "window_open_while_heating"
     assert payload["entities"] == ("climate.living_room",)
@@ -40,20 +48,28 @@ def test_review_redacts_secrets_before_provider():
 
 
 def test_disallowed_action_is_not_dispatched():
-    provider = FakeProvider(Decision("recommend", "Do not unlock", action="lock.unlock"))
+    provider = FakeProvider(
+        Decision("recommend", "Do not unlock", action="lock.unlock", shadow=False)
+    )
     workflow = SentinelWorkflow(provider)
     case = Case.create("manual", facts={"expected_state": "unlocked"})
     dispatched = []
-    result = workflow.execute(case, provider.decision, dispatched.append, lambda: "unlocked")
+    result = workflow.execute(
+        case, provider.decision, dispatched.append, lambda: "unlocked"
+    )
     assert result["authorization"]["status"] == "approval_required"
     assert dispatched == []
     assert result["verification"]["status"] == "not_executed"
 
 
 def test_reversible_action_is_sent_and_verified():
-    provider = FakeProvider(Decision("recommend", "Turn off lamp", action="light.turn_off"))
+    provider = FakeProvider(
+        Decision("recommend", "Turn off lamp", action="light.turn_off", shadow=False)
+    )
     workflow = SentinelWorkflow(provider)
-    case = Case.create("lamp_request", entities=["light.lamp"], facts={"expected_state": "off"})
+    case = Case.create(
+        "lamp_request", entities=["light.lamp"], facts={"expected_state": "off"}
+    )
     dispatched = []
     result = workflow.execute(case, provider.decision, dispatched.append, lambda: "off")
     assert dispatched == ["light.turn_off"]
@@ -62,12 +78,27 @@ def test_reversible_action_is_sent_and_verified():
 
 
 def test_failed_readback_reopens_case():
-    provider = FakeProvider(Decision("recommend", "Turn off lamp", action="light.turn_off"))
+    provider = FakeProvider(
+        Decision("recommend", "Turn off lamp", action="light.turn_off", shadow=False)
+    )
     workflow = SentinelWorkflow(provider)
     case = Case.create("lamp_request", facts={"expected_state": "off"})
     result = workflow.execute(case, provider.decision, lambda _: None, lambda: "on")
     assert result["verification"]["status"] == "mismatch"
     assert result["verification"]["next_step"] == "reopen_case"
+
+
+def test_shadow_decision_cannot_be_dispatched():
+    decision = Decision(
+        "recommend", "Turn off lamp", action="light.turn_off", shadow=True
+    )
+    workflow = SentinelWorkflow(FakeProvider(decision))
+    dispatched = []
+    result = workflow.execute(
+        Case.create("lamp_request"), decision, dispatched.append, lambda: "off"
+    )
+    assert result["authorization"]["status"] == "shadow_only"
+    assert dispatched == []
 
 
 def test_redact_handles_nested_values():
