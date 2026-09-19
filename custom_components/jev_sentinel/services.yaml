@@ -1,0 +1,32 @@
+review:
+  name: Review a bounded Home Assistant case with Jev
+  description: Ask Jev for a typed recommendation. This service is advisory and does not execute a device action.
+  fields:
+    event_type:
+      required: true
+      selector:
+        text:
+    area:
+      selector:
+        text:
+    entities:
+      selector:
+        object:
+    facts:
+      selector:
+        object:
+    requested_action:
+      selector:
+        text:
+verify:
+  name: Record a verification comparison
+  description: Emit a verification event for a deterministic readback workflow.
+  fields:
+    expected:
+      required: true
+      selector:
+        text:
+    actual:
+      required: true
+      selector:
+        text:
