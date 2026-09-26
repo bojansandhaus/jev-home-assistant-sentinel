@@ -13,3 +13,9 @@
 - [ ] The local route was exercised against a real `laya-serve`, not a mock, and the observed outcome, action, and confidence are recorded in the release notes.
 - [ ] The chained route was exercised against a real `laya-serve` for its local hop, and its hosted hop is reported as unit-test coverage only when no hosted key is available.
 - [ ] GitHub metadata and CI are read back after publication.
+- [ ] The local failure breaker is re-checked: three consecutive local failures fall back, the fourth is suppressed with no hosted call and the local error re-raised, a healthy local call resets the counter, and the counter is documented as per process and per copy, cleared by a restart.
+- [ ] Every log call on the decision path was audited, file by file, and none can carry a case, entity state, or an answer. Only an exception class name is logged.
+- [ ] The three named arrangements, `jev_api`, `laya_local`, and `laya_with_jev_fallback`, are offered in the config flow and exported from the package API, and the canonical route aliases resolve identically to them.
+- [ ] The DOGA 100-question benchmark numbers are cited as the headline quality evidence wherever local classifier quality is discussed, together with the limit that the breaker cannot detect a valid yet incorrect local judgment.
+- [ ] The note that the hosted endpoint's acceptance of the five-level confidence rubric is unverified is still carried.
+- [ ] No documentation writes the banned two-word phrase for the local classifier; the local model is described as Laya, and the hosted model as Jev.

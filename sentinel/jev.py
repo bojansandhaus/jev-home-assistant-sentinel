@@ -18,7 +18,9 @@ that answered to ``Decision.raw``. Nothing here imports Hermes internals.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
@@ -26,6 +28,8 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from .models import Decision
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # the chain is structural; nothing is imported at runtime
     from collections.abc import Sequence
@@ -49,6 +53,55 @@ _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 # such as 400 or 422, says the request itself was rejected, and the same request
 # is not retried somewhere else.
 FALLBACK_STATUS_CODES = frozenset({401, 403, 429})
+
+# The name of the route that runs on this machine. The chain uses it to tell its
+# local hop from a hosted one.
+LOCAL_PROVIDER = "laya"
+
+# A repeated local outage must not quietly turn every household case into remote
+# traffic, which is the privacy property this repository exists to protect.
+# Three consecutive local failures that qualified for the hosted fallback still
+# fall back; the fourth, and every one after it, is suppressed, the local error
+# is re-raised instead of being answered remotely, and a warning is logged. The
+# counter is per process and resets on restart, and any successful local call
+# resets it to zero.
+LOCAL_FALLBACK_FAILURE_LIMIT = 3
+_local_failure_lock = threading.Lock()
+_local_failure_count = 0
+
+
+def local_failure_count() -> int:
+    """The consecutive local failures recorded in this process."""
+    with _local_failure_lock:
+        return _local_failure_count
+
+
+def reset_local_failures() -> None:
+    """Clear the local failure counter after a successful local call."""
+    global _local_failure_count
+    with _local_failure_lock:
+        _local_failure_count = 0
+
+
+def note_local_failure(exc: BaseException) -> bool:
+    """Record one failed local attempt and say whether the hosted hop may answer.
+
+    Only the exception class name is logged. The case, the entity state, and the
+    answer never reach a log record. ``True`` means the count is still at or
+    below ``LOCAL_FALLBACK_FAILURE_LIMIT``, so the hosted fallback may be
+    attempted. ``False`` means the breaker is tripped and the caller must
+    re-raise the local error rather than answer it remotely.
+    """
+    global _local_failure_count
+    logger.warning(
+        "local %s decision failed (%s); considering the hosted fallback",
+        LOCAL_PROVIDER,
+        type(exc).__name__,
+    )
+    with _local_failure_lock:
+        _local_failure_count += 1
+        return _local_failure_count <= LOCAL_FALLBACK_FAILURE_LIMIT
+
 
 # The confidence question is a ``score`` question, and a score rubric is an
 # ordered list of level descriptions with index 0 first. A local Laya server
@@ -226,7 +279,11 @@ class LayaJev:
         )
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
-        return decision_from_body(body, model=self.model)
+        decision = decision_from_body(body, model=self.model)
+        # A successful local call clears the consecutive-failure count, on the
+        # local-only route and on the local hop of the chained route alike.
+        reset_local_failures()
+        return decision
 
 
 def is_fallback_trigger(exc: BaseException) -> bool:
@@ -264,12 +321,26 @@ class ChainedJev:
         return tuple(name for name, _ in self.providers)
 
     def decide(self, state: dict[str, Any]) -> Decision:
-        for index, (_, provider) in enumerate(self.providers):
+        for index, (name, provider) in enumerate(self.providers):
             try:
                 decision = provider.decide(state)
             except Exception as exc:
-                if index + 1 < len(self.providers) and is_fallback_trigger(exc):
-                    continue
+                if (
+                    index + 1 < len(self.providers)
+                    and is_fallback_trigger(exc)
+                    and name == LOCAL_PROVIDER
+                ):
+                    # A local failure that qualifies for the hosted fallback is
+                    # counted. Past the limit the local error is raised instead
+                    # of being answered remotely, so a local server that stays
+                    # down cannot send every case to a hosted API.
+                    if note_local_failure(exc):
+                        continue
+                    logger.warning(
+                        "hosted fallback suppressed after %d consecutive"
+                        " local failures",
+                        LOCAL_FALLBACK_FAILURE_LIMIT,
+                    )
                 raise
             return self._attributed(decision, index)
         raise RuntimeError("the chain has no provider left to call")

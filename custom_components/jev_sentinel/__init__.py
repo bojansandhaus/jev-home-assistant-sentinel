@@ -13,6 +13,7 @@ from .runtime import (
     SentinelWorkflow,
     build_provider,
     redact,
+    resolve_provider,
 )
 from .runtime import verify as verify_observation
 
@@ -25,9 +26,11 @@ def _provider_for(entry: ConfigEntry):
     """Build the configured route.
 
     A hosted route, a local Laya route, or the explicit ``laya_then_hosted``
-    chain. An entry without a ``provider`` field keeps the hosted route.
+    chain. A mode name such as ``jev_api``, ``laya_local``, or
+    ``laya_with_jev_fallback`` names the same route and is accepted here. An
+    entry without a ``provider`` field keeps the hosted route.
     """
-    provider = entry.data.get("provider", DEFAULT_PROVIDER)
+    provider = resolve_provider(entry.data.get("provider", DEFAULT_PROVIDER))
     return build_provider(
         provider,
         # The stored key belongs to the hosted hops. The local hop stays keyless

@@ -8,6 +8,7 @@ rejects it, and the score rubric is the ordered list a local server accepts.
 
 import importlib.util
 import json
+import logging
 import os
 import sys
 from email.message import Message
@@ -24,6 +25,11 @@ from sentinel import (
     LAYA_ENDPOINT_PATH,
     LAYA_MODEL,
     LAYA_TIMEOUT,
+    LOCAL_FALLBACK_FAILURE_LIMIT,
+    LOCAL_PROVIDER,
+    MODE_ALIASES,
+    MODE_NAMES,
+    PROVIDER_MODES,
     Case,
     ChainedJev,
     LayaJev,
@@ -34,7 +40,12 @@ from sentinel import (
     decision_questions,
     is_fallback_trigger,
     laya_endpoint,
+    local_failure_count,
+    note_local_failure,
+    provider_mode,
     provider_order,
+    reset_local_failures,
+    resolve_provider,
     validate_fallback_order,
 )
 from sentinel.jev import decision_from_body
@@ -54,6 +65,22 @@ LIVE_MODEL = os.environ.get("JEV_SENTINEL_LIVE_LAYA_MODEL", "english")
 live = pytest.mark.skipif(
     not LIVE_URL, reason="set JEV_SENTINEL_LIVE_LAYA to a running laya-serve URL"
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_local_failure_breaker():
+    """The consecutive-local-failure counter is process state, not case state.
+
+    Clear it before and after every test so one test's local failures cannot
+    trip the breaker for another. This is the same counter the runtime clears
+    after a successful local call, and the same one it clears on restart.
+    """
+    sys.modules["sentinel.jev"].reset_local_failures()
+    _runtime.reset_local_failures()
+    yield
+    sys.modules["sentinel.jev"].reset_local_failures()
+    _runtime.reset_local_failures()
+
 
 # One verbatim answer set from a local laya-serve (english checkpoint, CPU),
 # captured on 2026-09-26 for this repository's own rubric.
@@ -312,6 +339,40 @@ def test_the_runtime_bridge_carries_the_same_rules_as_the_package():
         {},
     ):
         assert _runtime.confidence_from_score(answer) == confidence_from_score(answer)
+    # The breaker and the named arrangements are carried by both copies too.
+    assert _runtime.LOCAL_FALLBACK_FAILURE_LIMIT == LOCAL_FALLBACK_FAILURE_LIMIT == 3
+    assert _runtime.MODE_ALIASES == MODE_ALIASES
+    assert _runtime.MODE_NAMES == MODE_NAMES
+    assert _runtime.PROVIDER_MODES == PROVIDER_MODES
+    assert tuple(_runtime.MODE_ALIASES.items()) == tuple(MODE_ALIASES.items())
+    for name in (
+        "jev_api",
+        "laya_local",
+        "laya_with_jev_fallback",
+        "JEV_API",
+        "openrouter",
+        LOCAL_PROVIDER,
+        CHAINED_PROVIDER,
+        "Laya",
+        "typesafe",
+    ):
+        assert _runtime.resolve_provider(name) == resolve_provider(name)
+    for provider in ("openrouter", LOCAL_PROVIDER, CHAINED_PROVIDER):
+        assert _runtime.provider_mode(provider) == provider_mode(provider)
+    for module in (sys.modules["sentinel.jev"], _runtime):
+        module.reset_local_failures()
+        assert module.local_failure_count() == 0
+        assert [module.note_local_failure(URLError("down")) for _ in range(3)] == [
+            True,
+            True,
+            True,
+        ]
+        assert module.local_failure_count() == module.LOCAL_FALLBACK_FAILURE_LIMIT
+        # The fourth consecutive failure trips the breaker.
+        assert module.note_local_failure(URLError("down")) is False
+        assert module.local_failure_count() == module.LOCAL_FALLBACK_FAILURE_LIMIT + 1
+        module.reset_local_failures()
+        assert module.local_failure_count() == 0
 
 
 def test_the_runtime_bridge_answers_the_local_wire_shape(monkeypatch):
@@ -553,6 +614,11 @@ def test_the_config_flow_offers_the_chained_route_and_keeps_the_hosted_default()
     for name in ('"openrouter"', "LOCAL_PROVIDER", "CHAINED_PROVIDER"):
         assert name in flow
     assert "api_key_required" in flow
+    # The config flow offers the three named arrangements and resolves the
+    # aliases onto the canonical routes before it validates the key.
+    for mode in MODE_NAMES:
+        assert mode in flow
+    assert "resolve_provider" in flow
 
 
 @live
@@ -649,3 +715,196 @@ def test_a_live_local_server_answers_the_chained_route_from_the_local_hop():
         decision.confidence,
         decision.raw,
     )
+
+
+def _outcome(function, provider, env):
+    """The result of a provider rule, or the text of the error it raised."""
+    try:
+        return function(provider, env=env)
+    except ValueError as exc:
+        return f"ValueError: {exc}"
+
+
+def _weak_answered(choice="ignore", score=0.0, action="none"):
+    """A valid but weak local answer: low confidence, or a confident non-answer."""
+    return {
+        "model": "laya-rl-agent",
+        "answers": {
+            "outcome": {"type": "choice", "choice": choice},
+            "action": {"type": "choice", "choice": action},
+            "confidence": {
+                "type": "score",
+                "score": score,
+                "legend": LIVE_SCORE_ANSWER["legend"],
+            },
+        },
+    }
+
+
+def test_the_named_arrangements_resolve_onto_their_routes():
+    assert MODE_NAMES == ("jev_api", "laya_local", "laya_with_jev_fallback")
+    assert MODE_ALIASES == {
+        "jev_api": "openrouter",
+        "laya_local": LOCAL_PROVIDER,
+        "laya_with_jev_fallback": CHAINED_PROVIDER,
+    }
+    assert PROVIDER_MODES == {
+        "openrouter": "jev_api",
+        LOCAL_PROVIDER: "laya_local",
+        CHAINED_PROVIDER: "laya_with_jev_fallback",
+    }
+    for alias, canonical in MODE_ALIASES.items():
+        assert resolve_provider(alias) == canonical
+        assert resolve_provider(alias.upper()) == canonical
+        assert provider_mode(canonical) == alias
+        for env in (
+            {},
+            {"OPENROUTER_API_KEY": "private"},
+            {"LAYA_API_KEY": "private"},
+            {"TYPESAFE_API_KEY": "private"},
+        ):
+            assert _outcome(provider_order, alias, env) == _outcome(
+                provider_order, canonical, env
+            )
+    assert isinstance(
+        build_provider("jev_api", api_key="private", env={}), OpenRouterJev
+    )
+    assert isinstance(build_provider("laya_local", env={}), LayaJev)
+    chained = build_provider("laya_with_jev_fallback", api_key="private", env={})
+    assert isinstance(chained, ChainedJev)
+    assert chained.names == (LOCAL_PROVIDER, "openrouter")
+    # A value that is not one of the three named arrangements is left alone, so
+    # the existing validation still rejects it exactly as before.
+    assert resolve_provider("Laya") == "Laya"
+    assert resolve_provider("typesafe") == "typesafe"
+    assert resolve_provider("") == ""
+    assert resolve_provider(None) == ""
+    with pytest.raises(ValueError, match="invalid provider"):
+        provider_order("Laya")
+    with pytest.raises(ValueError, match="invalid provider"):
+        provider_mode("Laya")
+    with pytest.raises(ValueError, match="invalid provider"):
+        provider_mode("auto")
+
+
+def test_the_breaker_allows_three_fallbacks_and_suppresses_the_fourth(monkeypatch):
+    package = sys.modules["sentinel.jev"]
+    hosted = "https://openrouter.ai/api/alpha/decisions"
+    transport = _local_fails(monkeypatch, package, URLError("local server is down"))
+    provider = build_provider(CHAINED_PROVIDER, api_key="private", env={})
+    state = {"case": {"event_type": "manual"}}
+    assert LOCAL_FALLBACK_FAILURE_LIMIT == 3
+    for _ in range(LOCAL_FALLBACK_FAILURE_LIMIT):
+        decision = provider.decide(state)
+        assert decision.raw["provider"] == "openrouter"
+        assert decision.raw["attempted"] == [LOCAL_PROVIDER, "openrouter"]
+    assert transport.attempts.count(hosted) == LOCAL_FALLBACK_FAILURE_LIMIT
+    assert local_failure_count() == LOCAL_FALLBACK_FAILURE_LIMIT
+    # The fourth consecutive local failure is not answered remotely: the local
+    # error is raised and no hosted request is made.
+    with pytest.raises(URLError, match="local server is down"):
+        provider.decide(state)
+    assert transport.attempts.count(hosted) == LOCAL_FALLBACK_FAILURE_LIMIT
+    assert transport.attempts[-1] == LOCAL_URL
+    assert local_failure_count() == LOCAL_FALLBACK_FAILURE_LIMIT + 1
+
+
+def test_a_healthy_local_call_resets_a_tripped_breaker(monkeypatch):
+    package = sys.modules["sentinel.jev"]
+    monkeypatch.setattr(package, "_local_failure_count", LOCAL_FALLBACK_FAILURE_LIMIT)
+    assert local_failure_count() == LOCAL_FALLBACK_FAILURE_LIMIT
+    _capture(monkeypatch, package, _answered())
+    provider = build_provider(CHAINED_PROVIDER, api_key="private", env={})
+    decision = provider.decide({"case": {"event_type": "manual"}})
+    assert decision.raw["provider"] == LOCAL_PROVIDER
+    assert local_failure_count() == 0
+
+
+def test_a_local_only_success_also_resets_the_breaker(monkeypatch):
+    package = sys.modules["sentinel.jev"]
+    monkeypatch.setattr(package, "_local_failure_count", LOCAL_FALLBACK_FAILURE_LIMIT)
+    _capture(monkeypatch, package, _answered())
+    LayaJev().decide({"case": {"event_type": "manual"}})
+    assert local_failure_count() == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _weak_answered(),
+        # A confident answer that is still not the safe outcome.
+        _weak_answered(choice="notify", score=4.0, action="notify"),
+    ],
+)
+def test_a_weak_or_wrong_local_answer_never_triggers_the_hosted_fallback(
+    monkeypatch, payload
+):
+    transport = _RecordingTransport(lambda request: _Response(payload))
+    monkeypatch.setattr(sys.modules["sentinel.jev"], "urlopen", transport)
+    provider = build_provider(CHAINED_PROVIDER, api_key="private", env={})
+    for _ in range(LOCAL_FALLBACK_FAILURE_LIMIT + 1):
+        decision = provider.decide({"case": {"event_type": "manual"}})
+        assert decision.raw["provider"] == LOCAL_PROVIDER
+        assert decision.raw["attempted"] == [LOCAL_PROVIDER]
+        # The local answer is used as it stands, weak or not.
+        assert decision.confidence is not None
+    # The fallback fires on a local failure, never on a weak or wrong answer. A
+    # hosted hop would have answered here, because the transport answers every
+    # URL, so the recorded attempts prove no hosted call was made.
+    assert transport.attempts == [LOCAL_URL] * (LOCAL_FALLBACK_FAILURE_LIMIT + 1)
+    assert local_failure_count() == 0
+
+
+def test_the_breaker_suppresses_a_local_outage_in_both_copies(monkeypatch):
+    package = sys.modules["sentinel.jev"]
+    hosted = "https://openrouter.ai/api/alpha/decisions"
+    for module, chain in (
+        (package, build_provider(CHAINED_PROVIDER, api_key="private", env={})),
+        (
+            _runtime,
+            _runtime.build_provider(
+                _runtime.CHAINED_PROVIDER, api_key="private", env={}
+            ),
+        ),
+    ):
+        module.reset_local_failures()
+        transport = _local_fails(monkeypatch, module, URLError("local server is down"))
+        for _ in range(module.LOCAL_FALLBACK_FAILURE_LIMIT):
+            assert (
+                chain.decide({"case": {"event_type": "manual"}}).raw["provider"]
+                == "openrouter"
+            )
+        with pytest.raises(URLError, match="local server is down"):
+            chain.decide({"case": {"event_type": "manual"}})
+        assert transport.attempts.count(hosted) == module.LOCAL_FALLBACK_FAILURE_LIMIT
+        assert module.local_failure_count() == module.LOCAL_FALLBACK_FAILURE_LIMIT + 1
+        module.reset_local_failures()
+
+
+def test_a_local_failure_logs_only_its_category(caplog):
+    private = "the bedroom window is open and the alarm code is 4321"
+    with caplog.at_level(logging.WARNING, logger="sentinel.jev"):
+        assert note_local_failure(RuntimeError(private)) is True
+    assert "RuntimeError" in caplog.text
+    assert private not in caplog.text
+    assert "4321" not in caplog.text
+
+
+def test_a_suppressed_fallback_logs_the_category_not_the_case(monkeypatch, caplog):
+    marker = "MARKER-bedroom-window-9911"
+    package = sys.modules["sentinel.jev"]
+    hosted = "https://openrouter.ai/api/alpha/decisions"
+    transport = _local_fails(monkeypatch, package, URLError("local server is down"))
+    provider = build_provider(CHAINED_PROVIDER, api_key="private", env={})
+    state = {"case": {"event_type": "manual", "facts": {"note": marker}}}
+    with caplog.at_level(logging.WARNING, logger="sentinel.jev"):
+        for _ in range(LOCAL_FALLBACK_FAILURE_LIMIT):
+            provider.decide(state)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="sentinel.jev"):
+        with pytest.raises(URLError, match="local server is down"):
+            provider.decide(state)
+    assert "URLError" in caplog.text
+    assert "suppressed" in caplog.text
+    assert marker not in caplog.text
+    assert transport.attempts.count(hosted) == LOCAL_FALLBACK_FAILURE_LIMIT

@@ -20,8 +20,10 @@ local server and a hosted endpoint in one review.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -29,6 +31,8 @@ from typing import Any, Callable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+logger = logging.getLogger(__name__)
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
@@ -44,6 +48,86 @@ _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 # such as 400 or 422, says the request itself was rejected, and the same request
 # is not retried somewhere else.
 FALLBACK_STATUS_CODES = frozenset({401, 403, 429})
+
+# A repeated local outage must not quietly turn every household case into remote
+# traffic. Three consecutive local failures that qualified for the hosted
+# fallback still fall back; the fourth, and every one after it, is suppressed,
+# the local error is re-raised instead of being answered remotely, and a warning
+# is logged. The counter is per process and resets on restart, and any
+# successful local call resets it to zero.
+LOCAL_FALLBACK_FAILURE_LIMIT = 3
+_local_failure_lock = threading.Lock()
+_local_failure_count = 0
+
+
+def local_failure_count() -> int:
+    """The consecutive local failures recorded in this process."""
+    with _local_failure_lock:
+        return _local_failure_count
+
+
+def reset_local_failures() -> None:
+    """Clear the local failure counter after a successful local call."""
+    global _local_failure_count
+    with _local_failure_lock:
+        _local_failure_count = 0
+
+
+def note_local_failure(exc: BaseException) -> bool:
+    """Record one failed local attempt and say whether the hosted hop may answer.
+
+    Only the exception class name is logged. The case, the entity state, and the
+    answer never reach a log record. ``True`` means the count is still at or
+    below ``LOCAL_FALLBACK_FAILURE_LIMIT``, so the hosted fallback may be
+    attempted. ``False`` means the breaker is tripped and the caller must
+    re-raise the local error rather than answer it remotely.
+    """
+    global _local_failure_count
+    logger.warning(
+        "local %s decision failed (%s); considering the hosted fallback",
+        LOCAL_PROVIDER,
+        type(exc).__name__,
+    )
+    with _local_failure_lock:
+        _local_failure_count += 1
+        return _local_failure_count <= LOCAL_FALLBACK_FAILURE_LIMIT
+
+
+# The three named arrangements, in the vocabulary the DOGA fork uses. Each name
+# resolves onto exactly one of the canonical route names above.
+MODE_ALIASES = {
+    "jev_api": "openrouter",
+    "laya_local": "laya",
+    "laya_with_jev_fallback": "laya_then_hosted",
+}
+MODE_NAMES = ("jev_api", "laya_local", "laya_with_jev_fallback")
+PROVIDER_MODES = {
+    "openrouter": "jev_api",
+    "laya": "laya_local",
+    "laya_then_hosted": "laya_with_jev_fallback",
+}
+
+
+def resolve_provider(name: object) -> str:
+    """Map a mode name or a canonical route name onto the canonical route name.
+
+    Only the three named arrangements are rewritten, and each is recognised in
+    either case. Any other value, including a canonical route name, is returned
+    unchanged so the existing validation still decides whether it is valid.
+    """
+    if not isinstance(name, str):
+        return ""
+    candidate = name.strip()
+    return MODE_ALIASES.get(candidate, MODE_ALIASES.get(candidate.lower(), candidate))
+
+
+def provider_mode(provider: str) -> str:
+    """The named arrangement for a canonical route name."""
+    canonical = resolve_provider(provider)
+    if canonical not in PROVIDER_MODES:
+        raise ValueError("invalid provider")
+    return PROVIDER_MODES[canonical]
+
 
 HOSTED_PROVIDERS = ("openrouter",)
 LOCAL_PROVIDERS = ("laya",)
@@ -280,7 +364,11 @@ class LayaJev:
         )
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
-        return decision_from_body(body, model=self.model)
+        decision = decision_from_body(body, model=self.model)
+        # A successful local call clears the consecutive-failure count, on the
+        # local-only route and on the local hop of the chained route alike.
+        reset_local_failures()
+        return decision
 
 
 def is_fallback_trigger(exc: BaseException) -> bool:
@@ -318,12 +406,26 @@ class ChainedJev:
         return tuple(name for name, _ in self.providers)
 
     def decide(self, state: dict[str, Any]) -> Decision:
-        for index, (_, provider) in enumerate(self.providers):
+        for index, (name, provider) in enumerate(self.providers):
             try:
                 decision = provider.decide(state)
             except Exception as exc:
-                if index + 1 < len(self.providers) and is_fallback_trigger(exc):
-                    continue
+                if (
+                    index + 1 < len(self.providers)
+                    and is_fallback_trigger(exc)
+                    and name == LOCAL_PROVIDER
+                ):
+                    # A local failure that qualifies for the hosted fallback is
+                    # counted. Past the limit the local error is raised instead
+                    # of being answered remotely, so a local server that stays
+                    # down cannot send every case to a hosted API.
+                    if note_local_failure(exc):
+                        continue
+                    logger.warning(
+                        "hosted fallback suppressed after %d consecutive"
+                        " local failures",
+                        LOCAL_FALLBACK_FAILURE_LIMIT,
+                    )
                 raise
             return self._attributed(decision, index)
         raise RuntimeError("the chain has no provider left to call")
@@ -358,6 +460,7 @@ def provider_order(
     env: dict[str, str] | None = None,
 ) -> list[str]:
     """Resolve the providers a configured route may call, in order."""
+    provider = resolve_provider(provider)
     if provider not in PROVIDER_NAMES:
         raise ValueError("invalid provider")
     order = validate_fallback_order(fallback_order)
@@ -414,6 +517,7 @@ def build_provider(
     configuration does not need it in the environment as well.
     """
     source = dict(os.environ if env is None else env)
+    provider = resolve_provider(provider)
     if api_key and provider != LOCAL_PROVIDER:
         source[PROVIDER_ENV["openrouter"]] = api_key
     order = provider_order(provider, fallback_order=fallback_order, env=source)

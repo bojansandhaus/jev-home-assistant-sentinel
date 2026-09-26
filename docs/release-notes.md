@@ -1,5 +1,39 @@
 # Release notes
 
+## v1.2.1
+
+Adds the local-failure circuit breaker, the three named arrangements, and category-only logging, porting the behaviour the DOGA fork shipped in its v1.3.0. The route surface is unchanged: hosted Jev, local Laya, and the opt-in chain are still the same three routes, and every one of them behaves as before until the breaker trips.
+
+### Added
+
+- A consecutive-local-failure circuit breaker on the local hop. Each local failure that qualified for the hosted fallback increments a counter; while the counter is at or below `LOCAL_FALLBACK_FAILURE_LIMIT`, which is 3, the hosted fallback is attempted; past 3 the fallback is suppressed, a warning is logged, and the local error is re-raised instead of being answered remotely. The counter is per process and resets on restart, and any successful local call resets it to zero, on the chained route and on the local-only route alike.
+- The three named arrangements in DOGA's vocabulary: `jev_api`, `laya_local`, and `laya_with_jev_fallback`. They are offered in the Home Assistant config flow and exported from the package API as `MODE_NAMES`, `MODE_ALIASES`, `PROVIDER_MODES`, `resolve_provider`, and `provider_mode`.
+- `LOCAL_FALLBACK_FAILURE_LIMIT`, `local_failure_count`, `reset_local_failures`, and `note_local_failure` in the package, and the same four names in the Home Assistant runtime bridge.
+- Category-only logging on the decision path. A local failure logs the exception class name and nothing else.
+
+### Changed
+
+- `provider_order` and `build_provider` resolve one of the three arrangement names onto its canonical route before validating, so `jev_api` and `openrouter`, `laya_local` and `laya`, and `laya_with_jev_fallback` and `laya_then_hosted` behave identically. No other value is rewritten: `Laya` and `typesafe` are still rejected with `ValueError("invalid provider")` exactly as before.
+- The config flow offers the three arrangements next to their canonical route aliases, and its key check runs against the resolved route, so `jev_api` and `laya_with_jev_fallback` require a key while `laya_local` does not.
+- The hosted route, the local route, and `auto` are untouched. An existing config entry with no `provider` field still keeps the hosted route, and an entry that stored `openrouter` keeps it.
+- Documentation covers the breaker, the named arrangements, and the benchmark evidence in the README, the reference, the integration guide, the FAQ, and the release checklist.
+
+### Evaluation and limitations
+
+- The headline quality evidence is the DOGA fork's 100-question, three-mode benchmark, run against DOGA v1.2.0 behaviour in a fresh process. On 100 authored, subjective labels, Laya local agreed with the labels on **goal 56/100 against Jev's 88/100**, **mode 41 against 68**, **stakes 37 against 67**, and **high-versus-low ambiguity 67 against 87**. Laya detected **no high-ambiguity labels at the 0.7 threshold** in 30 authored cases, against 21 of 30 for Jev. Both used a valid, well-formed answer in every case and injected a contract in all 100. Those labels are subjective and were authored before the Laya comparison, so this is a classifier agreement study, not a population accuracy estimate and not a final-answer quality study.
+- The breaker bounds repeated remote egress after local errors, but it cannot detect a valid yet incorrect local judgment. A Laya answer that is wrong but well formed is a success: it is returned as the decision and it resets the counter. Switch to `jev_api`, or stay on `laya` where the case never leaves the machine, rather than treating the trip threshold as a quality gate.
+- The hosted endpoint's acceptance of the five-level confidence rubric, and its own `score` scale, remain unverified. No hosted API key was available on the verification machine, so the hosted leg of the chained route is covered by unit tests with an injected transport only. Carried from v1.1.0 and v1.2.0.
+- The counter is per process. A restart clears it, so a crash loop that restarts the process repeatedly would keep re-arming up to three fallbacks each time. It is also per copy: the package and the Home Assistant runtime bridge hold their own counter, because Home Assistant loads the bridge without installing the package.
+- The plain local route never reaches the hosted provider, so the breaker only ever bounds egress on the chained route. On the local route the counter still resets on success, matching the hosted-fallback path.
+
+### Verification
+
+- Full local suite: 57 passed, 3 skipped, with the three live tests gated behind `JEV_SENTINEL_LIVE_LAYA`. With the live server on `127.0.0.1:8123`: 60 passed.
+- Formatting and static gate: `python -m black --check sentinel custom_components tests`, `python -m isort --check-only sentinel custom_components tests`, `python -m compileall -q sentinel custom_components tests`, `python -m json.tool` on `hacs.json` and the manifest, and `git diff --check` all pass.
+- The breaker is proved with an injected synthetic transport: three consecutive local failures each fall through to the hosted hop, the fourth raises the local error with no hosted request, and the recorded attempt list shows only the local URL on that fourth call. A healthy local call resets a tripped counter to zero on both the chained and the local-only route. A weak and a confidently wrong local answer are both returned as they stand, over four consecutive calls, with no hosted attempt and a counter that stays at zero. The same suppression is asserted in both copies of the provider rules.
+- The log audit is proved by capture: the failure warning contains the class name `RuntimeError` and never the message text, and the suppression warning never contains a case marker.
+- Live against `laya-serve`, English checkpoint, CPU, on `127.0.0.1:8123`, 2026-09-26: a review through `sentinel.LayaJev` returned `outcome: notify`, `action: light.turn_off`, `confidence: 0.602025`; one through the Home Assistant runtime bridge returned `outcome: recommend`, `action: light.turn_off`, `confidence: 0.648825`; and one through the chained route answered from the local hop with `outcome: notify`, `action: light.turn_off`, `confidence: 0.566225`, `raw: {"model": "laya-rl-agent", "provider": "laya", "attempted": ["laya"]}`. These are the values from one recorded run; the local score varies between runs, so treat a single `confidence` as a sample and not a stable measurement.
+
 ## v1.2.0
 
 Adds the third way to run the decision step, as an explicit opt-in. The first two are unchanged and still alternatives to each other: hosted Jev over an OpenRouter API key, or Laya on this machine with no API key. `laya_then_hosted` answers from the local server first and falls through to the hosted providers that have a key.

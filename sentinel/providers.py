@@ -29,9 +29,14 @@ from .jev import (
     LAYA_BASE_URL,
     LAYA_MODEL,
     LAYA_TIMEOUT,
+    LOCAL_FALLBACK_FAILURE_LIMIT,
+    LOCAL_PROVIDER,
     ChainedJev,
     LayaJev,
     OpenRouterJev,
+    local_failure_count,
+    note_local_failure,
+    reset_local_failures,
 )
 
 HOSTED_PROVIDERS = ("openrouter",)
@@ -40,7 +45,42 @@ CHAINED_PROVIDER = "laya_then_hosted"
 PROVIDER_NAMES = ("auto",) + HOSTED_PROVIDERS + LOCAL_PROVIDERS + (CHAINED_PROVIDER,)
 PROVIDER_ENV = {"openrouter": "OPENROUTER_API_KEY", "laya": "LAYA_API_KEY"}
 DEFAULT_FALLBACK_ORDER = ("openrouter",)
-LOCAL_PROVIDER = "laya"
+
+# The three named arrangements, in the vocabulary the DOGA fork uses. Each name
+# resolves onto exactly one canonical route name, which is what an entry stores
+# and what the config flow offers.
+MODE_ALIASES = {
+    "jev_api": "openrouter",
+    "laya_local": "laya",
+    "laya_with_jev_fallback": "laya_then_hosted",
+}
+MODE_NAMES = ("jev_api", "laya_local", "laya_with_jev_fallback")
+PROVIDER_MODES = {
+    "openrouter": "jev_api",
+    "laya": "laya_local",
+    "laya_then_hosted": "laya_with_jev_fallback",
+}
+
+
+def resolve_provider(name: object) -> str:
+    """Map a mode name or a canonical route name onto the canonical route name.
+
+    Only the three named arrangements are rewritten, and each is recognised in
+    either case. Any other value, including a canonical route name, is returned
+    unchanged so the existing validation still decides whether it is valid.
+    """
+    if not isinstance(name, str):
+        return ""
+    candidate = name.strip()
+    return MODE_ALIASES.get(candidate, MODE_ALIASES.get(candidate.lower(), candidate))
+
+
+def provider_mode(provider: str) -> str:
+    """The named arrangement for a canonical route name."""
+    canonical = resolve_provider(provider)
+    if canonical not in PROVIDER_MODES:
+        raise ValueError("invalid provider")
+    return PROVIDER_MODES[canonical]
 
 
 def validate_fallback_order(order: tuple[str, ...] | list[str]) -> tuple[str, ...]:
@@ -66,6 +106,7 @@ def provider_order(
     env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Resolve the providers a configured route may call, in order."""
+    provider = resolve_provider(provider)
     if provider not in PROVIDER_NAMES:
         raise ValueError("invalid provider")
     order = validate_fallback_order(fallback_order)
@@ -131,6 +172,7 @@ def build_provider(
     environment as well.
     """
     source = dict(os.environ if env is None else env)
+    provider = resolve_provider(provider)
     if api_key and provider != LOCAL_PROVIDER:
         source[PROVIDER_ENV["openrouter"]] = api_key
     order = provider_order(provider, fallback_order=fallback_order, env=source)

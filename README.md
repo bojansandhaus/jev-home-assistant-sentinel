@@ -13,7 +13,9 @@
 
 Jev Home Assistant Sentinel is a **Home Assistant integration** for **AI-assisted decisions** around physical devices. It sends a bounded case to Jev, applies a deterministic **policy check**, and records **state verification** separately from the command result. This **safety boundary** keeps recommendations advisory and makes the evidence visible.
 
-There are three ways to run the decision step. **Jev over a hosted API key** sends the bounded case to OpenRouter. **Laya on this machine** scores it locally with no API key at all. Those two are alternatives rather than members of one chain: [Laya](https://github.com/NandhaKishorM/laya) is a separate local model, not a hosted Jev endpoint, so selecting it replaces the hosted route instead of extending it. **Laya first, with the hosted key as fallback** is the third route, an explicit opt-in that answers from the local server and falls through to the hosted key when the local server fails.
+There are three ways to run the decision step, and each has a name. **`jev_api`** sends the bounded case to OpenRouter over a hosted API key. **`laya_local`** scores it on this machine with no API key at all. Those two are alternatives rather than members of one chain: [Laya](https://github.com/NandhaKishorM/laya) is a separate local model, not a hosted Jev endpoint, so selecting it replaces the hosted route instead of extending it. **`laya_with_jev_fallback`** is the third route, an explicit opt-in that answers from the local server and falls through to the hosted key when the local server fails, up to three consecutive local failures in one process.
+
+The wording matches the DOGA fork, where the same three arrangements ship. The canonical route names `openrouter`, `laya`, and `laya_then_hosted` are accepted as aliases, so an existing config entry keeps the route it stored.
 
 **Privacy note for the third route.** A failed local attempt sends the redacted case to a hosted API. Redaction runs before the first attempt and the same redacted case is used for both hops, so credential-shaped fields never leave the machine, but the case itself does leave the machine whenever the local server fails. The hosted route always leaves the machine, and the plain local route never does.
 
@@ -21,8 +23,8 @@ There are three ways to run the decision step. **Jev over a hosted API key** sen
 
 1. Add this repository to HACS as a custom integration.
 2. Restart Home Assistant and add **Jev Home Assistant Sentinel** from **Settings > Devices & services**.
-3. Choose a provider: **Jev over the OpenRouter API key**, **Laya on this machine (no API key)** when a local `laya-serve` is running, or **Laya first, with the hosted key as fallback** when you want the local server tried first.
-4. Call `jev_sentinel.review`. The v1.2.0 integration runs in shadow mode and emits a decision event. It does not dispatch a device action.
+3. Choose a route: **`jev_api`** (Jev over the OpenRouter API key), **`laya_local`** (Laya on this machine, no API key) when a local `laya-serve` is running, or **`laya_with_jev_fallback`** (Laya first, the hosted key behind it) when you want the local server tried first.
+4. Call `jev_sentinel.review`. The v1.2.1 integration runs in shadow mode and emits a decision event. It does not dispatch a device action.
 
 [![Add to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=bojansandhaus&repository=jev-home-assistant-sentinel&category=integration)
 
@@ -94,11 +96,13 @@ Restart Home Assistant, then add the integration through the UI.
 
 The config flow asks for one of three providers. The hosted route and the local route are mutually exclusive: it is Jev over a hosted API key, or Laya locally with no API key at all. The third is an explicit opt-in chain that uses both.
 
-| Provider | What it needs | Notes |
-|---|---|---|
-| `openrouter` (default) | An OpenRouter API key | Hosted Jev at `https://openrouter.ai/api/alpha/decisions`, model `typesafe/jev-1.13`. The key is stored in the Home Assistant config entry and passed to the runtime when `review` runs. |
-| `laya` | A running local `laya-serve` | No API key and no outbound request. `laya_base_url` defaults to `http://127.0.0.1:8000` and `laya_model` to `convaiinnovations/laya`. |
-| `laya_then_hosted` | A running local `laya-serve` **and** an OpenRouter API key | The chained route. `review` asks the local server first and, only when that attempt fails, sends the same redacted case to the hosted provider. |
+| Route | Arrangement name | What it needs | Notes |
+|---|---|---|---|
+| `openrouter` (default) | `jev_api` | An OpenRouter API key | Hosted Jev at `https://openrouter.ai/api/alpha/decisions`, model `typesafe/jev-1.13`. The key is stored in the Home Assistant config entry and passed to the runtime when `review` runs. |
+| `laya` | `laya_local` | A running local `laya-serve` | No API key and no outbound request. `laya_base_url` defaults to `http://127.0.0.1:8000` and `laya_model` to `convaiinnovations/laya`. |
+| `laya_then_hosted` | `laya_with_jev_fallback` | A running local `laya-serve` **and** an OpenRouter API key | The chained route. `review` asks the local server first and, only when that attempt fails, sends the same redacted case to the hosted provider, up to three consecutive local failures in one process. |
+
+Either spelling selects the same route. The config flow offers the arrangement name next to its canonical alias, and an entry that stored a canonical name keeps it.
 
 Do not put a key in YAML, Git, issue reports, screenshots, or logs.
 
@@ -106,7 +110,11 @@ The local route replaces the hosted route rather than joining it. It is a single
 
 The chained route is the only route that reaches both. Its order is the local server first, then every hosted provider that has a key, in the hosted order, which today is the OpenRouter key. It fails fast with `missing OPENROUTER_API_KEY for the laya_then_hosted route` when no hosted key is configured, because a chain with no fallback behind it would be the local route under another name. A hosted hop is tried only on a transport error, a timeout, or an HTTP 401, 403, 429, or 5xx from the local server. Any other reply, such as a 400 or 422, propagates unchanged, because a request the local server rejected as invalid would be rejected elsewhere too. The decision records which hop answered: `raw.provider` is `laya` or `openrouter`, and `raw.attempted` lists the hops that were tried.
 
-**Privacy.** On the chained route, a failed local attempt sends the redacted case to a hosted API. The redaction runs before the first attempt, so the same redacted case goes to both hops and credential-shaped fields never leave the machine. Everything else in the case does leave the machine when the local server fails. If a case must never leave the machine, select `laya` alone.
+**Circuit breaker.** A local server that stays down must not turn every household case into remote traffic, so the chained route counts consecutive local failures. The first three each fall through to the hosted hop. Past three, the fallback is suppressed, a warning is logged, and the local error is raised instead of the case being answered remotely. A successful local call resets the counter to zero, and the counter is per process, so it clears on restart. Only the exception class name is ever logged: no case content, entity state, or answer reaches a log record.
+
+**Quality evidence.** The local route's accuracy is measured by the DOGA fork's 100-question, three-mode benchmark. Against 100 authored, subjective labels, Laya local agreed on 56 goals and Jev on 88, on mode 41 against 68, on stakes 37 against 67, and on high-versus-low ambiguity at the 0.7 threshold 67 against 87. Laya detected none of the 30 authored high-ambiguity labels at 0.7. Those labels are subjective and were written before the Laya comparison, so treat this as a classifier agreement study and keep `jev_api` as the default while the local checkpoint is uncalibrated.
+
+**Privacy.** On the chained route, a failed local attempt sends the redacted case to a hosted API. The redaction runs before the first attempt, so the same redacted case goes to both hops and credential-shaped fields never leave the machine. Everything else in the case does leave the machine when the local server fails. If a case must never leave the machine, select `laya` alone. The breaker limits how long a local outage can keep doing that, but it cannot tell that a local answer was wrong.
 
 The options flow exposes `shadow`, defaulting to `true`. In the current source, the option is collected but the runtime always returns shadow decisions and the Home Assistant review handler never dispatches actions. Treat this as a documented boundary until a consumer implements active execution.
 
@@ -180,7 +188,15 @@ No. The Home Assistant review handler only emits a recommendation event. It does
 
 ### Can I use a different decision model than Jev?
 
-The integration ships three routes. Hosted Jev over the OpenRouter key, and Laya on this machine with no key, are alternatives. The third, `laya_then_hosted`, answers from Laya first and falls through to hosted Jev. The provider-neutral core also accepts another implementation of `DecisionProvider`.
+The integration ships three routes. `jev_api` (hosted Jev over the OpenRouter key) and `laya_local` (Laya on this machine with no key) are alternatives. `laya_with_jev_fallback` answers from Laya first and falls through to hosted Jev. The provider-neutral core also accepts another implementation of `DecisionProvider`.
+
+### What happens if the local server stays down?
+
+On `laya_with_jev_fallback`, the first three consecutive local failures each fall through to the hosted key. After that the fallback is suppressed for the rest of the process: the local error is raised, no hosted request is made, and a warning carrying only the exception class name is logged. Bring the local server back and one successful local call resets the counter. Nothing about the case is ever written to a log record.
+
+### How good is the local classifier?
+
+Measured, not assumed: on the DOGA fork's 100-question benchmark, against 100 authored and subjective labels, Laya local agreed on 56 goal labels against Jev's 88, on mode 41 against 68, on stakes 37 against 67, and on ambiguity at the 0.7 threshold 67 against 87, detecting none of the 30 authored high-ambiguity labels. Keep `jev_api` as the default while that checkpoint is uncalibrated, and read the numbers as agreement over one authored set rather than accuracy on your cases.
 
 ### Where is my API key stored?
 
@@ -222,7 +238,7 @@ On the chained route, the redacted case goes to a hosted API on the fallback. On
 - [Technical reference](docs/reference.md)
 - [Integration guide](docs/integrations.md)
 - [FAQ and troubleshooting](docs/faq.md)
-- [v1.2.0 release notes](docs/release-notes.md)
+- [v1.2.1 release notes](docs/release-notes.md)
 - [Contributing](CONTRIBUTING.md)
 - [MIT license](LICENSE)
 - [Jev Decisions reference project](https://github.com/bojansandhaus/jev-decisions)

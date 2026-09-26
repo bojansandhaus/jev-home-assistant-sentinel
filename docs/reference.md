@@ -8,7 +8,7 @@ The Home Assistant component creates a case, calls the configured provider, and 
 
 | Boundary | Source contract | Result |
 |---|---|---|
-| Provider | `OpenRouterJev.decide(state)` or `LayaJev.decide(state)` | `Decision` |
+| Provider | `OpenRouterJev.decide(state)`, `LayaJev.decide(state)`, or `ChainedJev.decide(state)` | `Decision` |
 | Policy | `Policy.authorize(action, user_approved=False)` | authorization dictionary |
 | Dispatch | caller-supplied callable | dispatch record |
 | Readback | caller-supplied callable or `verify` service values | verification record |
@@ -61,6 +61,16 @@ There are three routes. Two are alternatives rather than members of one chain, a
 1. Hosted Jev, over an OpenRouter API key.
 2. Laya, running on this machine, with no API key at all.
 3. `laya_then_hosted`: Laya first, then the hosted providers that have a key, as an explicit opt-in.
+
+Each route also has a name in the vocabulary the DOGA fork uses. The config flow offers the arrangement name next to its canonical route alias, and `resolve_provider` and `provider_mode` map between the two spellings:
+
+| Named arrangement | Canonical route | What runs |
+|---|---|---|
+| `jev_api` | `openrouter` | Hosted Jev over the API key. |
+| `laya_local` | `laya` | The local server alone, no key, no fallback. |
+| `laya_with_jev_fallback` | `laya_then_hosted` | The local server first, the hosted key behind it. |
+
+`MODE_NAMES` is the three arrangement names, `MODE_ALIASES` maps each onto its canonical route, and `PROVIDER_MODES` maps back. `resolve_provider(name)` rewrites an arrangement name, in either case, and returns anything else unchanged, so the canonical names keep their existing validation. `provider_mode(provider)` returns the arrangement name for a route and raises `ValueError("invalid provider")` for anything else, including `auto`.
 
 `provider_order(provider, fallback_order=..., env=...)` resolves a route and returns the providers it may call, in order:
 
@@ -141,6 +151,23 @@ A fallback happens only on a trigger, all of them covered by tests:
 
 `is_fallback_trigger(exc)` implements that rule, and `FALLBACK_STATUS_CODES` is `frozenset({401, 403, 429})`; a 5xx is matched by range. The route carries no cooldown and no retry: each hop is tried once, in order, and the error from the last hop propagates when every hop fails. This repository has never had a cooldown, and none was added here, so the timing behaviour of the two existing routes is unchanged.
 
+### Local failure circuit breaker
+
+A repeated local outage must not turn every household case into remote traffic, so the local hop is guarded by a consecutive-failure breaker:
+
+| Rule | Behaviour |
+|---|---|
+| A local failure that qualifies for the fallback | Increments the counter, and `note_local_failure` logs the exception class name. |
+| Counter at or below `LOCAL_FALLBACK_FAILURE_LIMIT`, which is `3` | The hosted fallback is attempted. |
+| Counter past the limit | The fallback is suppressed, a warning is logged, and the local error is re-raised. No hosted request is made. |
+| Any successful local call | Resets the counter to zero, on the chained route and on the local-only route alike. |
+
+The counter is process state, not case state. It is per process and resets on restart, and `local_failure_count()` reports it while `reset_local_failures()` clears it. Both copies of the provider rules carry the same four names, and the drift test asserts the same limit and the same trip behaviour in each.
+
+A local failure that is not a fallback trigger, such as an HTTP 422 for an invalid request, never reaches the breaker: it propagates immediately, because a request the local server rejected as invalid is not retried somewhere else and therefore creates no remote egress to bound.
+
+The breaker bounds repeated remote egress. It cannot detect a valid yet incorrect local judgment: a wrong but well-formed local answer is a success, so it is returned and it resets the counter.
+
 The route fails fast when no hosted provider has a key. `provider_order` raises `ValueError("missing OPENROUTER_API_KEY for the laya_then_hosted route")`, and `build_provider` passes that error through rather than returning a chain with a single local hop. A chain built directly with fewer than two adapters raises `ValueError("a chain needs at least two providers")`.
 
 **Privacy.** On this route, a failed local attempt sends the redacted case to a hosted API. The redaction runs before the first attempt, in `SentinelWorkflow.review`, so the local hop and the hosted hop receive the same redacted case and credential-shaped fields never leave the machine. The rest of the case does leave the machine whenever the local server fails. A case that must never leave the machine belongs on the `laya` route, which has no fallback.
@@ -188,6 +215,8 @@ Two limits are worth stating plainly:
 
 - No code in this repository compares `confidence` against a threshold. Policy authorization is driven by the action name, so the rubric change cannot move a decision across a boundary. The only consumers are the decision payload and the emitted event.
 - The hosted endpoint's acceptance of the five level list rubric, and its own `score` scale, were not verified in this version because no hosted API key was available. The mapping above is applied on both routes so the meaning of `confidence` is identical, but a hosted review should be run once to confirm the hosted scale.
+
+The quality evidence for the local route is the DOGA fork's 100-question, three-mode benchmark, run against DOGA v1.2.0 behaviour. On 100 authored, subjective labels it measured goal agreement of 56/100 for Laya local against 88/100 for Jev, mode 41 against 68, stakes 37 against 67, and high-versus-low ambiguity at the 0.7 threshold 67 against 87, with none of the 30 authored high-ambiguity labels detected by Laya at 0.7 against 21 of 30 for Jev. Those labels are subjective and predate the Laya comparison, so the numbers are an agreement study over one authored set, not a population accuracy estimate. Do not use them as a reason to lower the threshold: doing so on that set trades missed high ambiguity for false alarms.
 
 ## Policy check engine
 
@@ -281,8 +310,8 @@ The config flow stores `provider`, and the fields for the selected route:
 
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
-| `provider` | yes | `openrouter` | `openrouter` for hosted Jev over an API key, `laya` for a local server with no key, `laya_then_hosted` for the local server first with the hosted key as fallback. |
-| `api_key` | for `openrouter` and `laya_then_hosted` | empty | The hosted key. Selecting a route that reaches the hosted provider with an empty key returns the `api_key_required` error. |
+| `provider` | yes | `openrouter` | The route. `openrouter` or `jev_api` for hosted Jev over an API key, `laya` or `laya_local` for a local server with no key, `laya_then_hosted` or `laya_with_jev_fallback` for the local server first with the hosted key as fallback. Both spellings of a route behave identically, and the stored value is not rewritten. |
+| `api_key` | for `openrouter` and `laya_then_hosted` | empty | The hosted key. Selecting a route that reaches the hosted provider with an empty key returns the `api_key_required` error. The check runs against the resolved route, so `jev_api` and `laya_with_jev_fallback` require a key and `laya_local` does not. |
 | `laya_base_url` | no | `http://127.0.0.1:8000` | Local server URL, used on the `laya` route and on the local hop of `laya_then_hosted`. |
 | `laya_model` | no | `convaiinnovations/laya` | Laya checkpoint, used on the `laya` route and on the local hop of `laya_then_hosted`. |
 
@@ -290,7 +319,7 @@ An existing config entry created before v1.1.0 has no `provider` field and keeps
 
 ## Provider-neutral core
 
-The public package exports `Case`, `Decision`, `Policy`, `SentinelWorkflow`, `Verification`, `OpenRouterJev`, `LayaJev`, `ChainedJev`, `build_provider`, `provider_order`, `validate_fallback_order`, `is_fallback_trigger`, `confidence_from_score`, `decision_questions`, `laya_endpoint`, and the route constants `CHAINED_PROVIDER`, `DEFAULT_FALLBACK_ORDER`, `HOSTED_PROVIDERS`, `LOCAL_PROVIDERS`, and `FALLBACK_STATUS_CODES`. A provider implements:
+The public package exports `Case`, `Decision`, `Policy`, `SentinelWorkflow`, `Verification`, `OpenRouterJev`, `LayaJev`, `ChainedJev`, `build_provider`, `provider_order`, `validate_fallback_order`, `is_fallback_trigger`, `confidence_from_score`, `decision_questions`, `laya_endpoint`, `resolve_provider`, `provider_mode`, `local_failure_count`, `reset_local_failures`, `note_local_failure`, and the constants `CHAINED_PROVIDER`, `DEFAULT_FALLBACK_ORDER`, `HOSTED_PROVIDERS`, `LOCAL_PROVIDER`, `LOCAL_PROVIDERS`, `LOCAL_FALLBACK_FAILURE_LIMIT`, `MODE_ALIASES`, `MODE_NAMES`, `PROVIDER_MODES`, and `FALLBACK_STATUS_CODES`. A provider implements:
 
 ```python
 class DecisionProvider(Protocol):
@@ -303,9 +332,10 @@ class DecisionProvider(Protocol):
 
 ## Limitations
 
-- v1.2.0 has no active Home Assistant dispatch consumer.
+- v1.2.1 has no active Home Assistant dispatch consumer.
 - The integration does not poll entities or implement delayed readback.
-- Three provider routes ship: hosted Jev over an OpenRouter key, local Laya with no key, and the opt-in chain `laya_then_hosted`. The hosted hop is OpenRouter, which serves the TypeSafe `typesafe/jev-1.13` Jev model. A separate direct TypeSafe endpoint is not implemented, and no name outside these four providers is accepted.
+- Three provider routes ship: hosted Jev over an OpenRouter key, local Laya with no key, and the opt-in chain `laya_then_hosted`, each also addressable by its arrangement name `jev_api`, `laya_local`, or `laya_with_jev_fallback`. The hosted hop is OpenRouter, which serves the TypeSafe `typesafe/jev-1.13` Jev model. A separate direct TypeSafe endpoint is not implemented, and no name outside these providers is accepted.
+- The local failure breaker bounds repeated remote egress on the chained route only, and it cannot detect a valid yet incorrect local judgment. Its counter is per process, per copy, and resets on restart. Local classification quality is measured by the DOGA benchmark cited under [Confidence scale](#confidence-scale): Laya local agreed with 56 of 100 authored goal labels against 88 for Jev.
 - The chained route's hosted hop is covered by unit tests with an injected transport, not by a live hosted call, because no hosted API key was available on the verification machine. The live evidence for that route is its local hop.
 - The config-flow `shadow` option cannot enable active Home Assistant execution.
 - Home Assistant event handlers do not retain a durable decision ledger.
