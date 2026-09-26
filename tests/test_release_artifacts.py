@@ -16,7 +16,7 @@ def test_release_metadata_is_complete():
         "content_in_root": False,
         "zip_release": False,
     }
-    assert manifest["version"] == "1.1.0"
+    assert manifest["version"] == "1.2.0"
     assert manifest["integration_type"] == "service"
     assert manifest["domain"] == "jev_sentinel"
 

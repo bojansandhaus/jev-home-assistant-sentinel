@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect Jev Home Assistant Sentinel",
-        "description": "Choose one route. Hosted Jev runs over the OpenRouter API key. Laya runs on this machine with no API key.",
+        "description": "Choose one route. Hosted Jev runs over the OpenRouter API key. Laya runs on this machine with no API key. Laya first with the hosted key as fallback asks the local server first, then sends the same redacted case to the hosted endpoint if the local server fails.",
         "data": {
           "provider": "Provider",
           "api_key": "OpenRouter API key",
@@ -13,14 +13,14 @@
       }
     },
     "error": {
-      "api_key_required": "The OpenRouter route needs an API key. Select Laya only when a local laya-serve is running."
+      "api_key_required": "The hosted routes need an OpenRouter API key. Select Laya alone only when a local laya-serve is running."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Sentinel options",
-        "description": "Sentinel remains advisory in v1.1.0. This option is retained for forward compatibility.",
+        "description": "Sentinel remains advisory in v1.2.0. This option is retained for forward compatibility.",
         "data": {
           "shadow": "Shadow mode"
         }

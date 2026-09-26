@@ -1,25 +1,36 @@
 """Typed Jev adapter boundary.
 
-The public core accepts any DecisionProvider. Two adapters ship here, and they
-are alternatives rather than members of one chain:
+The public core accepts any DecisionProvider. Three adapters ship here:
 
 - ``OpenRouterJev`` calls hosted Jev over an OpenRouter API key.
 - ``LayaJev`` calls a local ``laya-serve`` process on this machine. It needs no
-  key, and it never joins the hosted route.
+  key.
+- ``ChainedJev`` answers from the first adapter in an ordered chain that
+  succeeds, so a caller can put the local server first and a hosted key behind
+  it.
 
-Both send the same rubric and read the same Decisions shaped answer, so a case
-reviewed locally and a case reviewed over the hosted route produce the same
-``Decision`` fields. Nothing here imports Hermes internals.
+Both single adapters send the same rubric and read the same Decisions shaped
+answer, so a case reviewed locally and a case reviewed over the hosted route
+produce the same ``Decision`` fields. The chain adds the name of the adapter
+that answered to ``Decision.raw``. Nothing here imports Hermes internals.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from .models import Decision
+
+if TYPE_CHECKING:  # the chain is structural; nothing is imported at runtime
+    from collections.abc import Sequence
+
+    from .workflow import DecisionProvider
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
@@ -32,6 +43,12 @@ LAYA_MODEL = "convaiinnovations/laya"
 # short for the local route, so it carries its own budget.
 LAYA_TIMEOUT = 120.0
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+# A failed attempt falls through to the next provider in a chain only when the
+# provider was unreachable, refused, rate limited, or broken. Any other status,
+# such as 400 or 422, says the request itself was rejected, and the same request
+# is not retried somewhere else.
+FALLBACK_STATUS_CODES = frozenset({401, 403, 429})
 
 # The confidence question is a ``score`` question, and a score rubric is an
 # ordered list of level descriptions with index 0 first. A local Laya server
@@ -210,3 +227,55 @@ class LayaJev:
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
         return decision_from_body(body, model=self.model)
+
+
+def is_fallback_trigger(exc: BaseException) -> bool:
+    """Whether a failed attempt should fall through to the next provider.
+
+    A transport error or timeout means the provider was not reachable. An HTTP
+    401, 403, or 429 means the request was refused or rate limited, and an HTTP
+    5xx means the provider failed. Each of those says nothing about the request
+    itself, so the next provider may still answer it. Any other failure
+    propagates: a request the provider rejected as invalid is not retried
+    somewhere else.
+    """
+    if isinstance(exc, HTTPError):
+        return exc.code in FALLBACK_STATUS_CODES or 500 <= exc.code <= 599
+    return isinstance(exc, (URLError, TimeoutError, OSError))
+
+
+class ChainedJev:
+    """An ordered chain of adapters: the first one that answers decides.
+
+    The chain holds named adapters in the order they are tried. A local Laya hop
+    can sit first with a hosted hop behind it, so a case costs no provider
+    request while the local server answers, and a local outage still returns a
+    decision. The adapter that answered is recorded in ``Decision.raw``.
+    """
+
+    def __init__(self, providers: "Sequence[tuple[str, DecisionProvider]]") -> None:
+        if len(providers) < 2:
+            raise ValueError("a chain needs at least two providers")
+        self.providers: tuple[tuple[str, DecisionProvider], ...] = tuple(providers)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The adapter names in the order they are tried."""
+        return tuple(name for name, _ in self.providers)
+
+    def decide(self, state: dict[str, Any]) -> Decision:
+        for index, (_, provider) in enumerate(self.providers):
+            try:
+                decision = provider.decide(state)
+            except Exception as exc:
+                if index + 1 < len(self.providers) and is_fallback_trigger(exc):
+                    continue
+                raise
+            return self._attributed(decision, index)
+        raise RuntimeError("the chain has no provider left to call")
+
+    def _attributed(self, decision: Decision, index: int) -> Decision:
+        raw = dict(decision.raw)
+        raw["provider"] = self.providers[index][0]
+        raw["attempted"] = list(self.names[: index + 1])
+        return replace(decision, raw=raw)

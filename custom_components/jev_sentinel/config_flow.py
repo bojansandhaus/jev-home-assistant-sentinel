@@ -1,8 +1,10 @@
 """Config flow for the Jev connection.
 
-Two routes are offered and they are alternatives: hosted Jev over an OpenRouter
-API key, or Laya on this machine with no key. The stored ``provider`` field
-selects one. An existing entry without that field keeps the hosted route.
+Three routes are offered. The hosted route and the local route are alternatives:
+hosted Jev over an OpenRouter API key, or Laya on this machine with no key. The
+third is the explicit opt-in chain, ``laya_then_hosted``, which answers from the
+local server first and falls through to the hosted key. The stored ``provider``
+field selects one. An existing entry without that field keeps the hosted route.
 """
 
 from __future__ import annotations
@@ -12,11 +14,12 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 
 from . import DEFAULT_PROVIDER, DOMAIN
-from .runtime import LAYA_BASE_URL, LAYA_MODEL, LOCAL_PROVIDER
+from .runtime import CHAINED_PROVIDER, LAYA_BASE_URL, LAYA_MODEL, LOCAL_PROVIDER
 
 PROVIDER_LABELS = {
     "openrouter": "Jev over the OpenRouter API key",
     LOCAL_PROVIDER: "Laya on this machine (no API key)",
+    CHAINED_PROVIDER: "Laya first, with the hosted key as fallback",
 }
 
 
@@ -31,6 +34,8 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input=None):
         errors: dict[str, str] = {}
         if user_input is not None:
+            # Both hosted routes need a key: the hosted route calls it directly,
+            # and the chained route needs it behind the local hop.
             if user_input.get("provider", DEFAULT_PROVIDER) != LOCAL_PROVIDER:
                 if not str(user_input.get("api_key", "")).strip():
                     errors["api_key"] = "api_key_required"
@@ -52,7 +57,10 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
             description_placeholders={
-                "provider": "a hosted Jev key or a local Laya server"
+                "provider": (
+                    "a hosted Jev key, a local Laya server,"
+                    " or Laya first with the hosted key as fallback"
+                )
             },
         )
 

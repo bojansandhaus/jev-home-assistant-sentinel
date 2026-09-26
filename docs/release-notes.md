@@ -1,5 +1,43 @@
 # Release notes
 
+## v1.2.0
+
+Adds the third way to run the decision step, as an explicit opt-in. The first two are unchanged and still alternatives to each other: hosted Jev over an OpenRouter API key, or Laya on this machine with no API key. `laya_then_hosted` answers from the local server first and falls through to the hosted providers that have a key.
+
+### Added
+
+- `ChainedJev`, an ordered chain of named adapters that returns the answer from the first adapter that answers and records the hop that answered in `Decision.raw`.
+- The `laya_then_hosted` route in the config flow, next to `openrouter` and `laya`, and in the package API through `CHAINED_PROVIDER`, `provider_order`, and `build_provider`.
+- `is_fallback_trigger(exc)` and `FALLBACK_STATUS_CODES == frozenset({401, 403, 429})`. A fallback is taken on a transport error, a timeout, or an HTTP 401, 403, 429, or 5xx from the earlier hop. Any other reply, such as 400, 404, or 422, and any malformed answer, propagates unchanged.
+- Decision attribution on the chained route: `raw.provider` names the hop that answered and `raw.attempted` lists the hops that were tried, in order.
+
+### Changed
+
+- `provider_order("laya_then_hosted")` resolves to `["laya", "openrouter"]` with a hosted key, and raises `ValueError("missing OPENROUTER_API_KEY for the laya_then_hosted route")` without one. The route fails fast rather than degrading into the local-only route under another name.
+- `validate_fallback_order` still rejects every non-hosted name, and a route name is now covered explicitly: `("laya_then_hosted",)` raises `ValueError("invalid fallback_order")`, like `("laya",)`, because a chain is not a member of a chain.
+- `build_provider` returns `ChainedJev` on the chained route. On that route `api_key` is the hosted key, and the local hop keeps its own optional `LAYA_API_KEY`.
+- The plain hosted and plain local routes are unchanged. `raw` on those routes still carries only `{"model": ...}`, `auto` still never selects the local route, and an existing config entry without a `provider` field still keeps the hosted route.
+- Documentation covers the route in the README, the reference, the integration guide, the FAQ, and the release checklist.
+
+### Verification
+
+- The full suite passes, including new tests for route resolution with one hosted key, with an extra `TYPESAFE_API_KEY` present, and with none; for a local success that never reaches the hosted hop; for a local failure that falls through and records `raw.provider: openrouter`; for the unchanged hosted and local routes; and for drift between the two copies of the provider rules.
+- The fallback is proved with an injected synthetic transport that fails on the local URL and records the hosted attempt. The covered triggers are connection refused, a DNS failure, a timeout, and HTTP 401, 403, 429, 500, and 503. An HTTP 422 does not fall through, and the error from the last hop propagates when every hop fails.
+- Live against `laya-serve` 0.3.20, English checkpoint, CPU, on `127.0.0.1:8123`, 2026-09-26: a review through `sentinel.LayaJev` returned `outcome: notify`, `action: light.turn_off`, `confidence: 0.573825`; one through the Home Assistant runtime bridge returned `outcome: recommend`, `action: light.turn_off`, `confidence: 0.63925`; and one through the new chained route answered from the local hop with `outcome: notify`, `action: light.turn_off`, `confidence: 0.53485`, `raw: {"model": "laya-rl-agent", "provider": "laya", "attempted": ["laya"]}`. Those are the values from one recorded run; the local score varies between runs, so treat a single `confidence` as a sample and not a stable measurement.
+- Live fallback probe: with the chained route pointed at a port where nothing listens, the real local hop raised connection refused, the hosted hop was attempted, and the real hosted endpoint answered HTTP 401 to a synthetic key. That shows the handoff fires over real sockets, and that the hosted leg cannot succeed on this machine.
+
+### Known limitations
+
+- The hosted leg of the chained route is covered by unit tests only. No hosted API key was available on the verification machine, so the hosted hop was never observed answering. The live probe above shows the hosted endpoint is reached and refuses a synthetic key.
+- The hosted endpoint's acceptance of the five level list rubric, and its own `score` scale, remain unverified. This is carried over from v1.1.0.
+- **Privacy.** On the chained route a failed local attempt sends the redacted case to a hosted API. Redaction runs before the first attempt, so both hops receive the same redacted case and credential-shaped fields never leave the machine, but the rest of the case does leave the machine when the local server fails. `laya` remains the only route that never leaves the machine.
+- The route carries no cooldown and no retry: each hop is tried once, in order. This repository has never had a cooldown and none was added, so the timing behaviour of the two existing routes is unchanged.
+- The chain follows the repository's hosted order, which has one member, `openrouter`, serving the TypeSafe `typesafe/jev-1.13` Jev model. A direct TypeSafe endpoint is still not implemented, and a `TYPESAFE_API_KEY` adds no hop.
+
+### Distribution note
+
+The repository can be installed through HACS as a custom repository. HACS default-list submission and remote metadata changes are distribution operations outside these release notes.
+
 ## v1.1.0
 
 Adds a second route and fixes the score rubric behind it. There are now exactly two mutually exclusive ways to run the decision step: Jev over a hosted API key, or Laya running locally with no API key at all. The local route replaces the hosted route for a profile. It does not extend it.

@@ -13,14 +13,16 @@
 
 Jev Home Assistant Sentinel is a **Home Assistant integration** for **AI-assisted decisions** around physical devices. It sends a bounded case to Jev, applies a deterministic **policy check**, and records **state verification** separately from the command result. This **safety boundary** keeps recommendations advisory and makes the evidence visible.
 
-There are two ways to run the decision step, and they are alternatives rather than members of one chain. **Jev over a hosted API key** sends the bounded case to OpenRouter. **Laya on this machine** scores it locally with no API key at all. [Laya](https://github.com/NandhaKishorM/laya) is a separate local model, not a hosted Jev endpoint, so selecting it replaces the hosted route instead of extending it.
+There are three ways to run the decision step. **Jev over a hosted API key** sends the bounded case to OpenRouter. **Laya on this machine** scores it locally with no API key at all. Those two are alternatives rather than members of one chain: [Laya](https://github.com/NandhaKishorM/laya) is a separate local model, not a hosted Jev endpoint, so selecting it replaces the hosted route instead of extending it. **Laya first, with the hosted key as fallback** is the third route, an explicit opt-in that answers from the local server and falls through to the hosted key when the local server fails.
+
+**Privacy note for the third route.** A failed local attempt sends the redacted case to a hosted API. Redaction runs before the first attempt and the same redacted case is used for both hops, so credential-shaped fields never leave the machine, but the case itself does leave the machine whenever the local server fails. The hosted route always leaves the machine, and the plain local route never does.
 
 ## Quick Start
 
 1. Add this repository to HACS as a custom integration.
 2. Restart Home Assistant and add **Jev Home Assistant Sentinel** from **Settings > Devices & services**.
-3. Choose a provider: **Jev over the OpenRouter API key**, or **Laya on this machine (no API key)** when a local `laya-serve` is running.
-4. Call `jev_sentinel.review`. The v1.1.0 integration runs in shadow mode and emits a decision event. It does not dispatch a device action.
+3. Choose a provider: **Jev over the OpenRouter API key**, **Laya on this machine (no API key)** when a local `laya-serve` is running, or **Laya first, with the hosted key as fallback** when you want the local server tried first.
+4. Call `jev_sentinel.review`. The v1.2.0 integration runs in shadow mode and emits a decision event. It does not dispatch a device action.
 
 [![Add to HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=bojansandhaus&repository=jev-home-assistant-sentinel&category=integration)
 
@@ -37,7 +39,7 @@ Consider a window left open while heating runs. Sentinel can review the bounded 
 ## What does it do?
 
 - Builds bounded cases from event type, area, entities, and facts.
-- Sends redacted case data to a hosted Jev key, or to a local Laya server with no key.
+- Sends redacted case data to a hosted Jev key, to a local Laya server with no key, or to the local server first with the hosted key as a fallback.
 - Returns a typed outcome, action, confidence, and shadow flag.
 - Checks actions against an explicit allowlist and approval set in the Python core.
 - Separates provider response, authorization, dispatch, and verification records.
@@ -90,16 +92,21 @@ Restart Home Assistant, then add the integration through the UI.
 
 ## Configuration
 
-The config flow asks for one of two providers. They are mutually exclusive: it is Jev over a hosted API key, or Laya locally with no API key at all.
+The config flow asks for one of three providers. The hosted route and the local route are mutually exclusive: it is Jev over a hosted API key, or Laya locally with no API key at all. The third is an explicit opt-in chain that uses both.
 
 | Provider | What it needs | Notes |
 |---|---|---|
 | `openrouter` (default) | An OpenRouter API key | Hosted Jev at `https://openrouter.ai/api/alpha/decisions`, model `typesafe/jev-1.13`. The key is stored in the Home Assistant config entry and passed to the runtime when `review` runs. |
 | `laya` | A running local `laya-serve` | No API key and no outbound request. `laya_base_url` defaults to `http://127.0.0.1:8000` and `laya_model` to `convaiinnovations/laya`. |
+| `laya_then_hosted` | A running local `laya-serve` **and** an OpenRouter API key | The chained route. `review` asks the local server first and, only when that attempt fails, sends the same redacted case to the hosted provider. |
 
 Do not put a key in YAML, Git, issue reports, screenshots, or logs.
 
 The local route replaces the hosted route rather than joining it. It is a single provider with no fallback, the default `auto` route never selects it, and the hosted provider order accepts only hosted names. Plain HTTP is accepted for `localhost`, `127.0.0.1`, and `::1` only, so household case data never travels over a cleartext remote link. The local route waits up to 120 seconds for a reply, because a CPU checkpoint takes seconds and a cold process takes longer.
+
+The chained route is the only route that reaches both. Its order is the local server first, then every hosted provider that has a key, in the hosted order, which today is the OpenRouter key. It fails fast with `missing OPENROUTER_API_KEY for the laya_then_hosted route` when no hosted key is configured, because a chain with no fallback behind it would be the local route under another name. A hosted hop is tried only on a transport error, a timeout, or an HTTP 401, 403, 429, or 5xx from the local server. Any other reply, such as a 400 or 422, propagates unchanged, because a request the local server rejected as invalid would be rejected elsewhere too. The decision records which hop answered: `raw.provider` is `laya` or `openrouter`, and `raw.attempted` lists the hops that were tried.
+
+**Privacy.** On the chained route, a failed local attempt sends the redacted case to a hosted API. The redaction runs before the first attempt, so the same redacted case goes to both hops and credential-shaped fields never leave the machine. Everything else in the case does leave the machine when the local server fails. If a case must never leave the machine, select `laya` alone.
 
 The options flow exposes `shadow`, defaulting to `true`. In the current source, the option is collected but the runtime always returns shadow decisions and the Home Assistant review handler never dispatches actions. Treat this as a documented boundary until a consumer implements active execution.
 
@@ -124,7 +131,7 @@ data:
   requested_action: climate.set_temperature
 ```
 
-The handler creates a case, calls Jev through OpenRouter, and fires `jev_sentinel_decision`. It does not call a Home Assistant device service.
+The handler creates a case, calls the configured route, and fires `jev_sentinel_decision`. It does not call a Home Assistant device service.
 
 ### Record a verification comparison
 
@@ -150,14 +157,16 @@ case = Case.create(
     facts={"expected_state": "off"},
 )
 
-# A hosted key, or a local laya-serve, chosen by configuration.
+# A hosted key, a local laya-serve, or the chained route, chosen by configuration.
 provider = build_provider("auto", api_key=hosted_key)
+# The explicit chain: the local server first, the hosted key behind it.
+provider = build_provider("laya_then_hosted", api_key=hosted_key)
 decision = SentinelWorkflow(provider).review(case)
 ```
 
 The core accepts any provider with `decide(state) -> Decision`. Its `execute` method can receive a dispatcher and readback callable, applies `Policy`, and returns separate authorization, dispatch, and verification records.
 
-`build_provider` and `provider_order` are the route rules: `provider_order("laya")` returns exactly `["laya"]`, `provider_order("auto")` never returns the local route, and `validate_fallback_order` rejects a local member.
+`build_provider` and `provider_order` are the route rules: `provider_order("laya")` returns exactly `["laya"]`, `provider_order("auto")` never returns the local route, `provider_order("laya_then_hosted")` returns `["laya", "openrouter"]` and raises `ValueError("missing OPENROUTER_API_KEY for the laya_then_hosted route")` without a hosted key, and `validate_fallback_order` rejects a local member or a route name.
 
 ## Frequently asked questions
 
@@ -171,7 +180,7 @@ No. The Home Assistant review handler only emits a recommendation event. It does
 
 ### Can I use a different decision model than Jev?
 
-The integration ships two routes: hosted Jev over the OpenRouter key, or Laya on this machine with no key. The provider-neutral core also accepts another implementation of `DecisionProvider`.
+The integration ships three routes. Hosted Jev over the OpenRouter key, and Laya on this machine with no key, are alternatives. The third, `laya_then_hosted`, answers from Laya first and falls through to hosted Jev. The provider-neutral core also accepts another implementation of `DecisionProvider`.
 
 ### Where is my API key stored?
 
@@ -204,12 +213,16 @@ Home Assistant listens on 8123 itself, so bind `laya-serve` to another port and 
 
 Yes, since v1.1.0, and it replaces the hosted route rather than joining it: `provider_order("laya")` returns exactly one provider, and the default route never selects the local one on its own initiative.
 
+### What happens to my case data when the local server fails?
+
+On the chained route, the redacted case goes to a hosted API on the fallback. On the plain local route there is no fallback, so a local failure is just a failure and the case never leaves the machine. If a case must never leave the machine, use `laya` alone. On every route the redaction runs first, so credential-shaped fields never leave the machine at all.
+
 ## Documentation and links
 
 - [Technical reference](docs/reference.md)
 - [Integration guide](docs/integrations.md)
 - [FAQ and troubleshooting](docs/faq.md)
-- [v1.1.0 release notes](docs/release-notes.md)
+- [v1.2.0 release notes](docs/release-notes.md)
 - [Contributing](CONTRIBUTING.md)
 - [MIT license](LICENSE)
 - [Jev Decisions reference project](https://github.com/bojansandhaus/jev-decisions)

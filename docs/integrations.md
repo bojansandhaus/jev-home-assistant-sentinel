@@ -146,7 +146,7 @@ The config flow exposes a `shadow` option, but the adapter remains shadow-only r
 - Send only the facts required for the case.
 - Credential-shaped keys are redacted before the provider request.
 - Keep a hosted key in the Home Assistant config entry. The local route stores nothing.
-- Prefer the local route when a case must not leave the host.
+- Prefer the local route when a case must not leave the host. That is `laya` alone: the `laya_then_hosted` chain sends the redacted case to a hosted API whenever the local server fails.
 - Treat provider confidence as a recommendation signal, not a sensor reading. On the shipped five level rubric it is an expected level rescaled onto 0 to 1, so adjacent values sit 0.25 apart.
 - Never use Sentinel as certified safety equipment, alarm control, emergency automation, or access control.
 - Keep approval and Home Assistant permissions authoritative.
@@ -162,12 +162,42 @@ LAYA_HOST=127.0.0.1 LAYA_PORT=8000 LAYA_MODELS=english laya-serve
 
 The first load takes 25 to 35 seconds, one review takes a few seconds on CPU, and the adapter waits up to 120 seconds. Home Assistant listens on 8123 itself, so bind the server elsewhere and set `laya_base_url` to that port. Keep the server on loopback, because a `laya-serve` started without `LAYA_API_KEY` accepts any request on the host.
 
+## Laya then hosted route
+
+Set `provider` to `laya_then_hosted` to answer from the local server first and keep a hosted key behind it. The route needs both a running `laya-serve` and an OpenRouter API key. It is an explicit opt-in: the hosted route and the `laya` route behave exactly as they did before, an existing config entry without a `provider` field keeps the hosted route, and no other route reaches the local server.
+
+```yaml
+# The chained route in the config flow
+provider: laya_then_hosted
+api_key: your-openrouter-key
+laya_base_url: http://127.0.0.1:8123
+laya_model: english
+```
+
+The same shape in the Python core:
+
+```python
+from sentinel import Case, SentinelWorkflow, build_provider
+
+provider = build_provider("laya_then_hosted", api_key=hosted_key)
+decision = SentinelWorkflow(provider).review(case)
+print(decision.raw["provider"], decision.raw["attempted"])
+```
+
+A hosted hop is tried only on a transport error, a timeout, or an HTTP 401, 403, 429, or 5xx from the local server. Any other local reply propagates, so a request the local server rejected as invalid is not quietly retried on the hosted side. The decision records the hop that answered in `raw.provider` and the hops that were tried in `raw.attempted`.
+
+**Privacy.** On this route a failed local attempt sends the redacted case to a hosted API. Sentinel redacts before the first attempt, so both hops receive the same redacted case and credential-shaped fields never leave the machine. The rest of the case does leave the machine when the local server fails. If a case must not leave the machine, use the `laya` route alone: `laya_then_hosted` is the one route that can reach both.
+
+Without a hosted key the route fails fast with `missing OPENROUTER_API_KEY for the laya_then_hosted route` instead of running as a local-only route under a different name.
+
 ## Troubleshooting
 
 | Symptom | Check |
 |---|---|
-| `review` fails before an event | Confirm the config entry provider matches what is running. On the OpenRouter route, check the key and reachability of `https://openrouter.ai/api/alpha/decisions`. On the Laya route, check that `laya-serve` is up and that `laya_base_url` matches its port. |
-| Decision event exists but no device changes | This is expected in v1.1.0. The integration is shadow-only. |
+| `review` fails before an event | Confirm the config entry provider matches what is running. On the OpenRouter route, check the key and reachability of `https://openrouter.ai/api/alpha/decisions`. On the Laya route, check that `laya-serve` is up and that `laya_base_url` matches its port. On the `laya_then_hosted` route, check both. |
+| `laya_then_hosted` raises `missing OPENROUTER_API_KEY for the laya_then_hosted route` | The chained route has no hosted key to fall back to. Add the key to the config entry; the route never runs as a local-only route under another name. |
+| A chained review answered with `raw.provider: openrouter` | The local hop failed and the case went to the hosted provider. Check that `laya-serve` is up and that `laya_base_url` matches its port; `raw.attempted` lists the hops that were tried. |
+| Decision event exists but no device changes | This is expected in v1.2.0. The integration is shadow-only. |
 | Verification says `mismatch` | Compare the actual value with the expected value and confirm the readback targeted the correct entity. |
 | Verification says `unavailable` | Keep the case open and notify or retry after the target becomes available. |
 | Status sensor remains `ready` | Confirm that `jev_sentinel_decision` was emitted and the sensor config entry is loaded. |

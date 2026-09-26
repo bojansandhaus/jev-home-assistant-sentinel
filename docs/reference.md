@@ -56,10 +56,11 @@ The runtime asks for `outcome`, `action`, and `confidence`. Outcomes are constra
 
 ## Provider routes
 
-There are exactly two routes, and they are alternatives rather than members of one chain:
+There are three routes. Two are alternatives rather than members of one chain, and the third is an explicit opt-in chain that uses both:
 
 1. Hosted Jev, over an OpenRouter API key.
 2. Laya, running on this machine, with no API key at all.
+3. `laya_then_hosted`: Laya first, then the hosted providers that have a key, as an explicit opt-in.
 
 `provider_order(provider, fallback_order=..., env=...)` resolves a route and returns the providers it may call, in order:
 
@@ -67,11 +68,12 @@ There are exactly two routes, and they are alternatives rather than members of o
 |---|---|---|
 | `"laya"` | `["laya"]` | Exactly one provider. The local route replaces the hosted route. |
 | `"openrouter"` | `["openrouter"]` | Raises `ValueError("missing OPENROUTER_API_KEY")` without a key. |
+| `"laya_then_hosted"` | `["laya", "openrouter"]` with a hosted key, and no result without one | Raises `ValueError("missing OPENROUTER_API_KEY for the laya_then_hosted route")` when no hosted provider has a key. |
 | `"auto"` (default) | `["openrouter"]` with a key, `[]` without | Never selects the local route on its own initiative. |
 
-`validate_fallback_order(order)` accepts a non-empty, duplicate-free order drawn from the hosted names only. `("openrouter", "laya")` and `("laya",)` both raise `ValueError("invalid fallback_order")`, so the local route cannot be added to the hosted order as a last resort. `provider_order` raises `ValueError("invalid provider")` for any name outside `auto`, `openrouter`, and `laya`, which here includes `typesafe`.
+`validate_fallback_order(order)` accepts a non-empty, duplicate-free order drawn from the hosted names only. `("openrouter", "laya")` and `("laya",)` both raise `ValueError("invalid fallback_order")`, so the local route cannot be added to the hosted order as a last resort. A route name is rejected there too: `("laya_then_hosted",)` raises the same error, because a chain is not a member of a chain. `provider_order` raises `ValueError("invalid provider")` for any name outside `auto`, `openrouter`, `laya`, and `laya_then_hosted`, which here includes `typesafe`.
 
-`build_provider(...)` returns the adapter for the resolved route, and raises `RuntimeError("no Jev provider is configured...")` when `auto` resolves to no provider. An explicit `api_key` also satisfies the route check, so a caller holding its key in its own configuration does not need it in the environment.
+`build_provider(...)` returns `LayaJev` for the local route, `OpenRouterJev` for the hosted route, and `ChainedJev` for the chained route. It raises `RuntimeError("no Jev provider is configured...")` when `auto` resolves to no provider. An explicit `api_key` also satisfies the route check, so a caller holding its key in its own configuration does not need it in the environment. On the chained route that key belongs to the hosted hops; the local hop keeps its own optional `LAYA_API_KEY`. On the local route, `api_key` is the optional bearer for a `laya-serve` started with its own check.
 
 ### Hosted OpenRouter provider
 
@@ -104,6 +106,46 @@ Before `SentinelWorkflow.review`, the core redacts dictionary keys containing `t
 | timeout | 120 s | CPU inference takes seconds per call and longer on a cold process. The hosted 30 s default is not used on this route. |
 
 `laya_endpoint(base_url, endpoint_path)` returns the resolved URL, and raises `ValueError` for a malformed URL, a path that does not start with `/`, or cleartext HTTP to a non-loopback host.
+
+### Laya then hosted route
+
+`ChainedJev` holds an ordered list of named adapters and returns the answer from the first one that answers. On the `laya_then_hosted` route the order is `laya` first and then every hosted provider that has a key, so the review costs no provider request while the local server answers:
+
+```json
+{
+  "outcome": "notify",
+  "reason": "notify",
+  "confidence": 0.60675,
+  "action": "light.turn_off",
+  "shadow": true,
+  "raw": {
+    "model": "laya-rl-agent",
+    "provider": "laya",
+    "attempted": ["laya"]
+  }
+}
+```
+
+`raw.provider` names the hop that answered and `raw.attempted` lists the hops that were tried, in order. The plain hosted and plain local routes are unchanged by this: their `raw` still carries only `{"model": ...}`.
+
+A fallback happens only on a trigger, all of them covered by tests:
+
+| Trigger from the earlier hop | Falls through |
+|---|---|
+| Transport error, an OSError or `URLError` such as connection refused or a DNS failure | yes |
+| Timeout | yes |
+| HTTP 401, 403, 429 | yes |
+| HTTP 5xx | yes |
+| HTTP 400, 404, 422 | no, the error propagates |
+| A malformed or unparseable answer | no, the error propagates |
+
+`is_fallback_trigger(exc)` implements that rule, and `FALLBACK_STATUS_CODES` is `frozenset({401, 403, 429})`; a 5xx is matched by range. The route carries no cooldown and no retry: each hop is tried once, in order, and the error from the last hop propagates when every hop fails. This repository has never had a cooldown, and none was added here, so the timing behaviour of the two existing routes is unchanged.
+
+The route fails fast when no hosted provider has a key. `provider_order` raises `ValueError("missing OPENROUTER_API_KEY for the laya_then_hosted route")`, and `build_provider` passes that error through rather than returning a chain with a single local hop. A chain built directly with fewer than two adapters raises `ValueError("a chain needs at least two providers")`.
+
+**Privacy.** On this route, a failed local attempt sends the redacted case to a hosted API. The redaction runs before the first attempt, in `SentinelWorkflow.review`, so the local hop and the hosted hop receive the same redacted case and credential-shaped fields never leave the machine. The rest of the case does leave the machine whenever the local server fails. A case that must never leave the machine belongs on the `laya` route, which has no fallback.
+
+Both copies of this rule, in `sentinel/jev.py` and in `custom_components/jev_sentinel/runtime.py`, are asserted equal by the drift test in `tests/test_laya_provider.py`.
 
 ### Confidence scale
 
@@ -239,16 +281,16 @@ The config flow stores `provider`, and the fields for the selected route:
 
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
-| `provider` | yes | `openrouter` | `openrouter` for hosted Jev over an API key, `laya` for a local server with no key. |
-| `api_key` | for `openrouter` | empty | The hosted key. Selecting `openrouter` with an empty key returns the `api_key_required` error. |
-| `laya_base_url` | no | `http://127.0.0.1:8000` | Local server URL, used on the `laya` route. |
-| `laya_model` | no | `convaiinnovations/laya` | Laya checkpoint, used on the `laya` route. |
+| `provider` | yes | `openrouter` | `openrouter` for hosted Jev over an API key, `laya` for a local server with no key, `laya_then_hosted` for the local server first with the hosted key as fallback. |
+| `api_key` | for `openrouter` and `laya_then_hosted` | empty | The hosted key. Selecting a route that reaches the hosted provider with an empty key returns the `api_key_required` error. |
+| `laya_base_url` | no | `http://127.0.0.1:8000` | Local server URL, used on the `laya` route and on the local hop of `laya_then_hosted`. |
+| `laya_model` | no | `convaiinnovations/laya` | Laya checkpoint, used on the `laya` route and on the local hop of `laya_then_hosted`. |
 
 An existing config entry created before v1.1.0 has no `provider` field and keeps the hosted route, so no migration is required. The options flow accepts optional boolean `shadow`, default `true`. The Home Assistant adapter remains shadow-only regardless of that option.
 
 ## Provider-neutral core
 
-The public package exports `Case`, `Decision`, `Policy`, `SentinelWorkflow`, `Verification`, `OpenRouterJev`, `LayaJev`, `build_provider`, `provider_order`, `validate_fallback_order`, `confidence_from_score`, `decision_questions`, `laya_endpoint`, and the route constants. A provider implements:
+The public package exports `Case`, `Decision`, `Policy`, `SentinelWorkflow`, `Verification`, `OpenRouterJev`, `LayaJev`, `ChainedJev`, `build_provider`, `provider_order`, `validate_fallback_order`, `is_fallback_trigger`, `confidence_from_score`, `decision_questions`, `laya_endpoint`, and the route constants `CHAINED_PROVIDER`, `DEFAULT_FALLBACK_ORDER`, `HOSTED_PROVIDERS`, `LOCAL_PROVIDERS`, and `FALLBACK_STATUS_CODES`. A provider implements:
 
 ```python
 class DecisionProvider(Protocol):
@@ -261,9 +303,10 @@ class DecisionProvider(Protocol):
 
 ## Limitations
 
-- v1.1.0 has no active Home Assistant dispatch consumer.
+- v1.2.0 has no active Home Assistant dispatch consumer.
 - The integration does not poll entities or implement delayed readback.
-- Two provider routes ship: hosted Jev over an OpenRouter key, and local Laya with no key. A separate hosted TypeSafe route is not implemented.
+- Three provider routes ship: hosted Jev over an OpenRouter key, local Laya with no key, and the opt-in chain `laya_then_hosted`. The hosted hop is OpenRouter, which serves the TypeSafe `typesafe/jev-1.13` Jev model. A separate direct TypeSafe endpoint is not implemented, and no name outside these four providers is accepted.
+- The chained route's hosted hop is covered by unit tests with an injected transport, not by a live hosted call, because no hosted API key was available on the verification machine. The live evidence for that route is its local hop.
 - The config-flow `shadow` option cannot enable active Home Assistant execution.
 - Home Assistant event handlers do not retain a durable decision ledger.
 - Local scoring quality and the hosted side of the new rubric are unmeasured. See [Confidence scale](#confidence-scale).

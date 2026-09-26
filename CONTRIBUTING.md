@@ -93,7 +93,7 @@ Every pull request must pass:
 
 A change that adds active execution must include an explicit approval model, allowlist behavior, dispatch failure handling, readback behavior, and tests for uncertainty. A change that alters the provider payload must update the reference documentation and redaction tests.
 
-The provider contract exists twice: in `sentinel/` and in `custom_components/jev_sentinel/runtime.py`, because Home Assistant installs the component without the package. Change both, and let `tests/test_laya_provider.py` prove they still agree on the rubric, the route orders, and the confidence mapping. Provider changes must keep the two routes mutually exclusive: the local route stays a single provider, `auto` never selects it, and the hosted order keeps rejecting it.
+The provider contract exists twice: in `sentinel/` and in `custom_components/jev_sentinel/runtime.py`, because Home Assistant installs the component without the package. Change both, and let `tests/test_laya_provider.py` prove they still agree on the rubric, the route orders, and the confidence mapping. Provider changes must keep the two alternative routes mutually exclusive: the local route stays a single provider, `auto` never selects it, and the hosted order keeps rejecting it. The opt-in `laya_then_hosted` chain is the only route that reaches both, and it fails fast when no hosted provider has a key.
 
 ## Documentation rules
 

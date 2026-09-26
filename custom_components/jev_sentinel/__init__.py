@@ -22,13 +22,17 @@ DEFAULT_PROVIDER = "openrouter"
 
 
 def _provider_for(entry: ConfigEntry):
-    """Build the configured route: hosted Jev over a key, or Laya locally."""
+    """Build the configured route.
+
+    A hosted route, a local Laya route, or the explicit ``laya_then_hosted``
+    chain. An entry without a ``provider`` field keeps the hosted route.
+    """
     provider = entry.data.get("provider", DEFAULT_PROVIDER)
     return build_provider(
         provider,
-        # Only the hosted route carries a stored key. The local route stays
-        # keyless unless laya-serve was started with its own bearer check, in
-        # which case LAYA_API_KEY supplies it.
+        # The stored key belongs to the hosted hops. The local hop stays keyless
+        # unless laya-serve was started with its own bearer check, in which case
+        # LAYA_API_KEY supplies it.
         api_key=None if provider == LOCAL_PROVIDER else entry.data.get("api_key"),
         laya_base_url=entry.data.get("laya_base_url") or LAYA_BASE_URL,
         laya_model=entry.data.get("laya_model") or LAYA_MODEL,
