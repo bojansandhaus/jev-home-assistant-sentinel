@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jev-home-sentinel"
-version = "1.0.0"
+version = "1.1.0"
 description = "Safe, verified Home Assistant decisions with Jev"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,12 @@ test = ["pytest>=8", "black>=24", "isort>=5"]
 
 [tool.setuptools]
 packages = ["sentinel"]
+
+# The CI lint step runs Black and isort over the same tree. isort's default
+# output disagrees with Black on any wrapped import, so the profile is pinned
+# to the Black compatible one.
+[tool.isort]
+profile = "black"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

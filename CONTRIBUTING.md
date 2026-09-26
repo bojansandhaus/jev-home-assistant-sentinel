@@ -46,6 +46,14 @@ python -m json.tool custom_components/jev_sentinel/manifest.json >/dev/null
 python -m json.tool hacs.json >/dev/null
 ```
 
+The live local route is opt in, because CI has no model server. Start `laya-serve` and point the test at it:
+
+```bash
+JEV_SENTINEL_LIVE_LAYA=http://127.0.0.1:8000 JEV_SENTINEL_LIVE_LAYA_MODEL=english python -m pytest tests/test_laya_provider.py -v
+```
+
+Those two tests make a real request through the package adapter and through the Home Assistant runtime bridge. They skip when the variable is unset, so a mock never stands in for a live answer.
+
 The test extra installs the required formatters in the isolated environment. Run:
 
 ```bash
@@ -84,6 +92,8 @@ Every pull request must pass:
 - documentation review for exact service names, fields, event names, and limitations.
 
 A change that adds active execution must include an explicit approval model, allowlist behavior, dispatch failure handling, readback behavior, and tests for uncertainty. A change that alters the provider payload must update the reference documentation and redaction tests.
+
+The provider contract exists twice: in `sentinel/` and in `custom_components/jev_sentinel/runtime.py`, because Home Assistant installs the component without the package. Change both, and let `tests/test_laya_provider.py` prove they still agree on the rubric, the route orders, and the confidence mapping. Provider changes must keep the two routes mutually exclusive: the local route stays a single provider, `auto` never selects it, and the hosted order keeps rejecting it.
 
 ## Documentation rules
 

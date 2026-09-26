@@ -3,7 +3,11 @@
 Home Assistant installs custom_components without installing the repository's
 Python package, so this small bridge keeps the integration independently usable.
 The public ``sentinel`` package carries the same provider neutral contract for
-applications and tests outside Home Assistant.
+applications and tests outside Home Assistant, including the same rubric and the
+same provider selection rules.
+
+Two routes ship here and they are alternatives rather than members of one chain:
+hosted Jev over an OpenRouter API key, or Laya on this machine with no key.
 """
 
 from __future__ import annotations
@@ -15,12 +19,39 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
+
+LAYA_BASE_URL = "http://127.0.0.1:8000"
+LAYA_ENDPOINT_PATH = "/v1/systemone"
+LAYA_MODEL = "convaiinnovations/laya"
+LAYA_TIMEOUT = 120.0
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+HOSTED_PROVIDERS = ("openrouter",)
+LOCAL_PROVIDERS = ("laya",)
+PROVIDER_NAMES = ("auto",) + HOSTED_PROVIDERS + LOCAL_PROVIDERS
+PROVIDER_ENV = {"openrouter": "OPENROUTER_API_KEY", "laya": "LAYA_API_KEY"}
+DEFAULT_FALLBACK_ORDER = ("openrouter",)
+LOCAL_PROVIDER = "laya"
+
 _SECRET_TEXT = re.compile(
     r"(?i)(api[_ -]?key|token|password|secret|credential)(\s*[:=]\s*)[^\s,;]+"
+)
+
+# The confidence question is a ``score`` question, and a score rubric is an
+# ordered list of level descriptions with index 0 first. A local Laya server
+# rejects ``{"min": 0, "max": 1}`` with "a score question takes 'criteria' as a
+# list of level descriptions, index 0 first".
+CONFIDENCE_LEVELS = (
+    "very low confidence, the case is ambiguous or mostly missing",
+    "low confidence",
+    "moderate confidence",
+    "high confidence",
+    "very high confidence, the case points one way",
 )
 
 
@@ -74,7 +105,84 @@ class Decision:
         return asdict(self)
 
 
+def decision_questions() -> dict[str, dict]:
+    """The rubric both routes send. A fresh mapping on every call."""
+    return {
+        "outcome": {
+            "type": "choice",
+            "instructions": "Choose the safest next outcome for this Home Assistant case.",
+            "criteria": {
+                "ignore": "No meaningful action",
+                "notify": "Tell the user",
+                "ask_user": "Need user approval or clarification",
+                "recommend": "Recommend a safe allowlisted action",
+                "escalate": "Treat as unresolved or risky",
+            },
+        },
+        "action": {
+            "type": "choice",
+            "instructions": "Choose one action only if it is supported by the case and policy.",
+            "criteria": {
+                "notify": "Notify the user",
+                "ask_user": "Ask the user",
+                "light.turn_off": "Turn off a light",
+                "switch.turn_off": "Turn off a switch",
+                "climate.set_temperature": "Set a climate temperature",
+                "none": "No device action",
+            },
+        },
+        "confidence": {
+            "type": "score",
+            "instructions": "Score confidence in the selected outcome, from very low to very high.",
+            "criteria": list(CONFIDENCE_LEVELS),
+        },
+    }
+
+
+def confidence_from_score(
+    answer: object, *, levels: tuple[str, ...] = CONFIDENCE_LEVELS
+) -> float | None:
+    """Map a score answer's expected level index onto 0 to 1.
+
+    A ``score`` answer reports the expected level on the legend index scale,
+    ``0`` to ``len(legend) - 1``, next to the ``legend`` naming each level. That
+    index is rescaled onto 0 to 1 by dividing by ``len(legend) - 1``, so level 0
+    is 0.0 and the last level is 1.0. The result is a quantized ordinal
+    estimate, not a calibrated probability: adjacent levels sit
+    ``1 / (levels - 1)`` apart. The raw index stays recoverable by multiplying
+    the returned value by ``levels - 1``.
+
+    A missing, non numeric, or single level answer returns ``None``.
+    """
+    if not isinstance(answer, dict):
+        return None
+    score = answer.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    legend = answer.get("legend")
+    count = len(legend) if isinstance(legend, (dict, list)) else len(levels)
+    if count < 2:
+        return None
+    return min(1.0, max(0.0, float(score) / (count - 1)))
+
+
+def decision_from_body(body: dict, *, model: str = MODEL) -> Decision:
+    """Build the typed ``Decision`` from a Decisions shaped response body."""
+    answers = body["answers"]
+    action = answers["action"]["choice"]
+    return Decision(
+        answers["outcome"]["choice"],
+        answers["outcome"]["choice"].replace("_", " "),
+        confidence_from_score(answers.get("confidence")),
+        None if action == "none" else action,
+        True,
+        {"model": body.get("model", model)},
+    )
+
+
 class OpenRouterJev:
+    """Hosted Jev over an OpenRouter API key."""
+
     def __init__(self, api_key: str | None = None, *, timeout: float = 30.0) -> None:
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         self.timeout = timeout
@@ -84,37 +192,7 @@ class OpenRouterJev:
             raise RuntimeError(
                 "Configure an OpenRouter API key before requesting a Jev review"
             )
-        questions = {
-            "outcome": {
-                "type": "choice",
-                "instructions": "Choose the safest next outcome for this Home Assistant case.",
-                "criteria": {
-                    "ignore": "No meaningful action",
-                    "notify": "Tell the user",
-                    "ask_user": "Need approval or clarification",
-                    "recommend": "Recommend a safe action",
-                    "escalate": "Treat as unresolved or risky",
-                },
-            },
-            "action": {
-                "type": "choice",
-                "instructions": "Choose one action only when supported by the case.",
-                "criteria": {
-                    "notify": "Notify the user",
-                    "ask_user": "Ask the user",
-                    "light.turn_off": "Turn off a light",
-                    "switch.turn_off": "Turn off a switch",
-                    "climate.set_temperature": "Set a temperature",
-                    "none": "No device action",
-                },
-            },
-            "confidence": {
-                "type": "score",
-                "instructions": "Score confidence from 0 to 1.",
-                "criteria": {"min": 0, "max": 1},
-            },
-        }
-        payload = {"model": MODEL, "state": state, "questions": questions}
+        payload = {"model": MODEL, "state": state, "questions": decision_questions()}
         request = Request(
             ENDPOINT,
             data=json.dumps(payload).encode(),
@@ -127,16 +205,134 @@ class OpenRouterJev:
         )
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
-        answers = body["answers"]
-        action = answers["action"]["choice"]
-        return Decision(
-            answers["outcome"]["choice"],
-            answers["outcome"]["choice"].replace("_", " "),
-            answers["confidence"].get("score"),
-            None if action == "none" else action,
-            True,
-            {"model": body.get("model", MODEL)},
+        return decision_from_body(body, model=MODEL)
+
+
+def laya_endpoint(
+    base_url: str = LAYA_BASE_URL, endpoint_path: str = LAYA_ENDPOINT_PATH
+) -> str:
+    """Resolve a local Laya server URL, refusing cleartext to a remote host."""
+    if not endpoint_path.startswith("/"):
+        raise ValueError("invalid Laya endpoint path")
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("invalid Laya base URL")
+    if parsed.scheme == "http" and parsed.hostname not in _LOOPBACK_HOSTS:
+        raise ValueError("nonlocal Laya server requires HTTPS")
+    return base_url.rstrip("/") + endpoint_path
+
+
+class LayaJev:
+    """A local ``laya-serve`` process, over the same Decisions contract.
+
+    Laya is not a hosted Jev endpoint. It is a separate model that publishes
+    ``POST /v1/systemone`` and answers in the same ``answers`` shape, so
+    selecting it replaces the hosted route instead of extending it. The route is
+    keyless: the ``Authorization`` header is omitted entirely unless the server
+    was started with its own bearer check.
+    """
+
+    def __init__(
+        self,
+        base_url: str = LAYA_BASE_URL,
+        *,
+        endpoint_path: str = LAYA_ENDPOINT_PATH,
+        model: str = LAYA_MODEL,
+        api_key: str | None = None,
+        timeout: float = LAYA_TIMEOUT,
+    ) -> None:
+        self.endpoint = laya_endpoint(base_url, endpoint_path)
+        self.model = model
+        self.api_key = (
+            api_key if api_key is not None else os.environ.get("LAYA_API_KEY")
         )
+        self.timeout = timeout
+
+    def decide(self, state: dict[str, Any]) -> Decision:
+        payload = {
+            "model": self.model,
+            "state": state,
+            "questions": decision_questions(),
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = Request(
+            self.endpoint,
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with urlopen(request, timeout=self.timeout) as response:
+            body = json.loads(response.read().decode())
+        return decision_from_body(body, model=self.model)
+
+
+def validate_fallback_order(order: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Accept a hosted provider order, and reject a local member."""
+    if (
+        not order
+        or len(set(order)) != len(order)
+        or any(name not in HOSTED_PROVIDERS for name in order)
+    ):
+        raise ValueError("invalid fallback_order")
+    return tuple(order)
+
+
+def provider_order(
+    provider: str = "auto",
+    *,
+    fallback_order: tuple[str, ...] | list[str] = DEFAULT_FALLBACK_ORDER,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Resolve the providers a configured route may call, in order."""
+    if provider not in PROVIDER_NAMES:
+        raise ValueError("invalid provider")
+    order = validate_fallback_order(fallback_order)
+    if provider == LOCAL_PROVIDER:
+        return [LOCAL_PROVIDER]
+    source = os.environ if env is None else env
+    keys = {name: source.get(var, "").strip() for name, var in PROVIDER_ENV.items()}
+    if provider == "auto":
+        return [name for name in order if keys[name]]
+    if not keys[provider]:
+        raise ValueError("missing " + PROVIDER_ENV[provider])
+    return [provider]
+
+
+def build_provider(
+    provider: str = "auto",
+    *,
+    api_key: str | None = None,
+    laya_base_url: str = LAYA_BASE_URL,
+    laya_model: str = LAYA_MODEL,
+    timeout: float | None = None,
+    fallback_order: tuple[str, ...] | list[str] = DEFAULT_FALLBACK_ORDER,
+    env: dict[str, str] | None = None,
+) -> "OpenRouterJev | LayaJev":
+    """Build the adapter for the configured route.
+
+    An explicit hosted key also supplies the key for the route check, so a
+    caller that holds the key in its own configuration does not need it in the
+    environment as well.
+    """
+    source = dict(os.environ if env is None else env)
+    if api_key and provider != LOCAL_PROVIDER:
+        source[PROVIDER_ENV["openrouter"]] = api_key
+    order = provider_order(provider, fallback_order=fallback_order, env=source)
+    if not order:
+        raise RuntimeError(
+            "no Jev provider is configured: add an OpenRouter key"
+            " or select the local Laya provider"
+        )
+    if order[0] == LOCAL_PROVIDER:
+        return LayaJev(
+            laya_base_url,
+            model=laya_model,
+            api_key=api_key,
+            timeout=LAYA_TIMEOUT if timeout is None else timeout,
+        )
+    return OpenRouterJev(api_key, timeout=30.0 if timeout is None else timeout)
 
 
 def redact(value: Any) -> Any:
@@ -179,7 +375,9 @@ class Policy:
 
 
 class SentinelWorkflow:
-    def __init__(self, provider: OpenRouterJev, policy: Policy | None = None) -> None:
+    def __init__(
+        self, provider: OpenRouterJev | LayaJev, policy: Policy | None = None
+    ) -> None:
         self.provider = provider
         self.policy = policy or Policy()
 

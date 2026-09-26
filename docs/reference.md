@@ -4,14 +4,16 @@ This reference describes the public contracts implemented in `custom_components/
 
 ## Runtime boundaries
 
-The Home Assistant component creates a case, calls `OpenRouterJev`, and fires events. It does not dispatch a Home Assistant device service. The standalone core adds policy authorization and execution callbacks for an external consumer.
+The Home Assistant component creates a case, calls the configured provider, and fires events. It does not dispatch a Home Assistant device service. The standalone core adds policy authorization and execution callbacks for an external consumer.
 
 | Boundary | Source contract | Result |
 |---|---|---|
-| Provider | `OpenRouterJev.decide(state)` | `Decision` |
+| Provider | `OpenRouterJev.decide(state)` or `LayaJev.decide(state)` | `Decision` |
 | Policy | `Policy.authorize(action, user_approved=False)` | authorization dictionary |
 | Dispatch | caller-supplied callable | dispatch record |
 | Readback | caller-supplied callable or `verify` service values | verification record |
+
+Both providers answer the same call: they send `{"model": ..., "state": ..., "questions": ...}` and read an `answers` mapping keyed by question id.
 
 ## Case schema
 
@@ -46,11 +48,32 @@ The Home Assistant component creates a case, calls `OpenRouterJev`, and fires ev
 }
 ```
 
-The runtime asks for `outcome`, `action`, and `confidence`. Outcomes are constrained by the request to `ignore`, `notify`, `ask_user`, `recommend`, or `escalate`. Actions offered to Jev are `notify`, `ask_user`, `light.turn_off`, `switch.turn_off`, `climate.set_temperature`, and `none`. The runtime converts `none` to `action: null`.
+The runtime asks for `outcome`, `action`, and `confidence`. Outcomes are constrained by the request to `ignore`, `notify`, `ask_user`, `recommend`, or `escalate`. Actions offered to the model are `notify`, `ask_user`, `light.turn_off`, `switch.turn_off`, `climate.set_temperature`, and `none`. The runtime converts `none` to `action: null`.
+
+`confidence` is a float in `[0.0, 1.0]` or `null`. Its scale is defined under [Confidence scale](#confidence-scale).
 
 `shadow` is true in the runtime and core defaults. `SentinelWorkflow.execute` refuses to dispatch a shadow decision and returns `authorization.status: shadow_only`. Only a caller-created non-shadow decision can enter the provider-neutral execution path.
 
-## OpenRouter provider
+## Provider routes
+
+There are exactly two routes, and they are alternatives rather than members of one chain:
+
+1. Hosted Jev, over an OpenRouter API key.
+2. Laya, running on this machine, with no API key at all.
+
+`provider_order(provider, fallback_order=..., env=...)` resolves a route and returns the providers it may call, in order:
+
+| `provider` | Result | Notes |
+|---|---|---|
+| `"laya"` | `["laya"]` | Exactly one provider. The local route replaces the hosted route. |
+| `"openrouter"` | `["openrouter"]` | Raises `ValueError("missing OPENROUTER_API_KEY")` without a key. |
+| `"auto"` (default) | `["openrouter"]` with a key, `[]` without | Never selects the local route on its own initiative. |
+
+`validate_fallback_order(order)` accepts a non-empty, duplicate-free order drawn from the hosted names only. `("openrouter", "laya")` and `("laya",)` both raise `ValueError("invalid fallback_order")`, so the local route cannot be added to the hosted order as a last resort. `provider_order` raises `ValueError("invalid provider")` for any name outside `auto`, `openrouter`, and `laya`, which here includes `typesafe`.
+
+`build_provider(...)` returns the adapter for the resolved route, and raises `RuntimeError("no Jev provider is configured...")` when `auto` resolves to no provider. An explicit `api_key` also satisfies the route check, so a caller holding its key in its own configuration does not need it in the environment.
+
+### Hosted OpenRouter provider
 
 The runtime posts JSON to:
 
@@ -64,9 +87,65 @@ The model is:
 typesafe/jev-1.13
 ```
 
-The payload has `model`, `state`, and `questions`. The request carries `Authorization: Bearer <key>`, `Content-Type: application/json`, and an `X-Title` header. A missing key or provider error prevents a decision from being emitted.
+The payload has `model`, `state`, and `questions`. The request carries an `Authorization: Bearer <key>` header, `Content-Type: application/json`, and an `X-Title` header. A missing key or provider error prevents a decision from being emitted.
 
-Before `SentinelWorkflow.review`, the core redacts dictionary keys containing `token`, `password`, `secret`, `api_key`, or `credential`, case-insensitively. Redaction replaces the value with `[REDACTED]` and recurses through dictionaries and lists.
+Before `SentinelWorkflow.review`, the core redacts dictionary keys containing `token`, `password`, `secret`, `api_key`, or `credential`, case-insensitively. Redaction replaces the value with `[REDACTED]`, masks credential-shaped text inside string values, and recurses through dictionaries and lists.
+
+### Local Laya provider
+
+`LayaJev` points the same payload at a `laya-serve` process on loopback. Laya publishes `POST /v1/systemone` in the same Decisions contract, so the request and response path match the hosted route except for the host, the absence of a credential, and the `model` field, which names a Laya checkpoint instead of a Jev model.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `laya_base_url` | `http://127.0.0.1:8000` | Where the server listens. Plain HTTP is accepted only for `localhost`, `127.0.0.1`, and `::1`; any other host raises `ValueError("nonlocal Laya server requires HTTPS")`. Home Assistant itself listens on 8123, so bind `laya-serve` elsewhere with `LAYA_PORT` and point this at that port. |
+| `laya_endpoint_path` | `/v1/systemone` | The route `laya-serve` exposes. |
+| `laya_model` | `convaiinnovations/laya` | Asks the server to choose a checkpoint from the script and language of the state. `english`, `multilingual`, and `typed-decisions` name a checkpoint directly. Any other value, including a Jev model id, is ignored by the server and auto-routes. |
+| `LAYA_API_KEY` | unset | Forwarded only when the server was started with `LAYA_API_KEY`. Without it the request carries no `Authorization` header at all. |
+| timeout | 120 s | CPU inference takes seconds per call and longer on a cold process. The hosted 30 s default is not used on this route. |
+
+`laya_endpoint(base_url, endpoint_path)` returns the resolved URL, and raises `ValueError` for a malformed URL, a path that does not start with `/`, or cleartext HTTP to a non-loopback host.
+
+### Confidence scale
+
+The `confidence` question is a `score` question, and a score rubric is an ordered list of level descriptions with index 0 first. The previous `{"min": 0, "max": 1}` mapping is not a valid score rubric: a local Laya server rejects it with
+
+```text
+question 'confidence': a score question takes 'criteria' as a list of level descriptions, index 0 first
+```
+
+The shipped rubric has five levels:
+
+```text
+0  very low confidence, the case is ambiguous or mostly missing
+1  low confidence
+2  moderate confidence
+3  high confidence
+4  very high confidence, the case points one way
+```
+
+A `score` answer reports the expected level on the legend index scale, `0` to `len(legend) - 1`, next to the `legend` naming each level. `confidence_from_score(answer)` rescales that index onto `[0, 1]`:
+
+```text
+confidence = score / (len(legend) - 1), clamped to [0, 1]
+```
+
+Properties, all covered by tests:
+
+| Input | Result |
+|---|---|
+| legend index `0` | `0.0` |
+| legend index `4`, the last of five | `1.0` |
+| legend index `2.011` | `0.50275` |
+| index above the last level | clamped to `1.0` |
+| index below `0` | clamped to `0.0` |
+| missing, non-numeric, boolean, or single level answer | `null` |
+
+The result is a quantized ordinal estimate, not a calibrated probability. Adjacent levels sit `1 / (levels - 1)` apart, which is `0.25` on the shipped five level rubric. The rescale is linear, so the raw index stays recoverable by multiplying the returned value by `levels - 1`. `Decision.raw` still carries only `{"model": ...}`, as before, because the index is recoverable.
+
+Two limits are worth stating plainly:
+
+- No code in this repository compares `confidence` against a threshold. Policy authorization is driven by the action name, so the rubric change cannot move a decision across a boundary. The only consumers are the decision payload and the emitted event.
+- The hosted endpoint's acceptance of the five level list rubric, and its own `score` scale, were not verified in this version because no hosted API key was available. The mapping above is applied on both routes so the meaning of `confidence` is identical, but a hosted review should be run once to confirm the hosted scale.
 
 ## Policy check engine
 
@@ -156,11 +235,20 @@ Each config entry creates `sensor.<entry_name>_status` with unique ID `jev_senti
 
 ## Configuration
 
-The config flow stores a required `api_key` in the config entry. Its options flow accepts optional boolean `shadow`, default `true`. The Home Assistant adapter remains shadow-only regardless of that option. Home Assistant version support is declared by the project target and should be validated against the actual manifest when packaging.
+The config flow stores `provider`, and the fields for the selected route:
+
+| Field | Required | Default | Meaning |
+|---|---:|---|---|
+| `provider` | yes | `openrouter` | `openrouter` for hosted Jev over an API key, `laya` for a local server with no key. |
+| `api_key` | for `openrouter` | empty | The hosted key. Selecting `openrouter` with an empty key returns the `api_key_required` error. |
+| `laya_base_url` | no | `http://127.0.0.1:8000` | Local server URL, used on the `laya` route. |
+| `laya_model` | no | `convaiinnovations/laya` | Laya checkpoint, used on the `laya` route. |
+
+An existing config entry created before v1.1.0 has no `provider` field and keeps the hosted route, so no migration is required. The options flow accepts optional boolean `shadow`, default `true`. The Home Assistant adapter remains shadow-only regardless of that option.
 
 ## Provider-neutral core
 
-The public package exports `Case`, `Decision`, `Policy`, and `SentinelWorkflow`. A provider implements:
+The public package exports `Case`, `Decision`, `Policy`, `SentinelWorkflow`, `Verification`, `OpenRouterJev`, `LayaJev`, `build_provider`, `provider_order`, `validate_fallback_order`, `confidence_from_score`, `decision_questions`, `laya_endpoint`, and the route constants. A provider implements:
 
 ```python
 class DecisionProvider(Protocol):
@@ -169,10 +257,13 @@ class DecisionProvider(Protocol):
 
 `review` passes a redacted case and sorted allowed actions to the provider. `execute` rejects shadow decisions, authorizes non-shadow actions, calls `dispatch(action)` when allowed, catches dispatch failures, calls `readback()`, and records verification. It never hides an authorization or readback failure behind a successful dispatch record.
 
+`custom_components/jev_sentinel/runtime.py` is a self-contained copy of the adapter, rubric, route selection, redaction, policy, workflow, and verification contracts, because Home Assistant installs `custom_components` without installing the package. `tests/test_laya_provider.py` asserts that both copies produce the same rubric, the same route orders, and the same confidence mapping, so the two cannot drift silently.
+
 ## Limitations
 
-- v1.0.0 has no active Home Assistant dispatch consumer.
+- v1.1.0 has no active Home Assistant dispatch consumer.
 - The integration does not poll entities or implement delayed readback.
-- The OpenRouter adapter is the only shipped Home Assistant provider.
+- Two provider routes ship: hosted Jev over an OpenRouter key, and local Laya with no key. A separate hosted TypeSafe route is not implemented.
 - The config-flow `shadow` option cannot enable active Home Assistant execution.
 - Home Assistant event handlers do not retain a durable decision ledger.
+- Local scoring quality and the hosted side of the new rubric are unmeasured. See [Confidence scale](#confidence-scale).

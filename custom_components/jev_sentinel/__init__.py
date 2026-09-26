@@ -5,11 +5,34 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 
-from .runtime import Case, OpenRouterJev, SentinelWorkflow, redact
+from .runtime import (
+    LAYA_BASE_URL,
+    LAYA_MODEL,
+    LOCAL_PROVIDER,
+    Case,
+    SentinelWorkflow,
+    build_provider,
+    redact,
+)
 from .runtime import verify as verify_observation
 
 DOMAIN = "jev_sentinel"
 PLATFORMS = ["sensor"]
+DEFAULT_PROVIDER = "openrouter"
+
+
+def _provider_for(entry: ConfigEntry):
+    """Build the configured route: hosted Jev over a key, or Laya locally."""
+    provider = entry.data.get("provider", DEFAULT_PROVIDER)
+    return build_provider(
+        provider,
+        # Only the hosted route carries a stored key. The local route stays
+        # keyless unless laya-serve was started with its own bearer check, in
+        # which case LAYA_API_KEY supplies it.
+        api_key=None if provider == LOCAL_PROVIDER else entry.data.get("api_key"),
+        laya_base_url=entry.data.get("laya_base_url") or LAYA_BASE_URL,
+        laya_model=entry.data.get("laya_model") or LAYA_MODEL,
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -27,7 +50,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             facts=call.data.get("facts", {}),
             requested_action=call.data.get("requested_action"),
         )
-        provider = OpenRouterJev(entry.data.get("api_key"))
+        provider = _provider_for(entry)
         workflow = SentinelWorkflow(provider)
         decision = await hass.async_add_executor_job(workflow.review, case)
         hass.bus.async_fire(
