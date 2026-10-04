@@ -6,18 +6,22 @@ The public ``sentinel`` package carries the same provider neutral contract for
 applications and tests outside Home Assistant, including the same rubric and the
 same provider selection rules.
 
-Routes ship here:
+Four decision modes ship here, and each names which side leads:
 
-- hosted Jev over an OpenRouter API key;
-- Cloudflare Clef over a Workers AI account and API token, with ``clef`` and
-  ``clef-flash`` as two checkpoints of the one provider;
-- Laya on this machine with no key;
-- Laya first, then the hosted providers that are configured, as an explicit
-  opt-in chain;
-- Clef first, then the hosted Jev provider, as an explicit opt-in chain.
+- ``api_with_local_fallback``: the hosted API leads, the local slot is behind it;
+- ``api_only``: the hosted API alone, and a failure is never rerouted;
+- ``local_only``: the local slot alone, and a failure is never rerouted;
+- ``local_with_api_fallback``: the local slot leads, the hosted API is behind it.
 
-The first two are alternatives. The last two are the only routes that reach two
-providers in one review.
+Which hosted model answers the API side is still its own choice and is not
+renamed: hosted Jev over an OpenRouter API key, and Cloudflare Clef over a
+Workers AI account and API token with ``clef`` and ``clef-flash`` as two
+checkpoints of the one provider. The local slot is named ``laya`` and is generic:
+``local_model`` selects which local decision model answers, so Laya, Kev, Tev1,
+or a jeff checkpoint are configuration rather than a new provider name.
+
+Every name this repository shipped before the four-mode contract still resolves,
+so an existing config entry keeps the routing it stored.
 """
 
 from __future__ import annotations
@@ -45,6 +49,22 @@ LAYA_ENDPOINT_PATH = "/v1/systemone"
 LAYA_MODEL = "convaiinnovations/laya"
 LAYA_TIMEOUT = 120.0
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+# The local route is a generic local decision-model slot. The provider name in
+# configuration stays ``laya``; ``local_model`` is the engine or checkpoint name
+# the local server is asked for, and it is interchangeable with any other model
+# that publishes the same ``/v1/systemone`` contract.
+LOCAL_MODEL = "laya"
+# The stored config-entry field that selects the local engine. It lives beside
+# the Clef checkpoint field so the form and the entry builder cannot drift.
+LOCAL_MODEL_FIELD = "local_model"
+# The shape a local model name may take. This is deliberately a character shape
+# and not a list of model names: a local model published after this release must
+# work by configuration alone, with no code change. It rejects empty and
+# whitespace-only values, control characters, quotes and backslashes that would
+# corrupt a JSON string, and the URL delimiters ``?``, ``#``, and ``&`` that would
+# corrupt a path segment if the value is ever placed in one.
+_LOCAL_MODEL_SHAPE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:+/-]*\Z")
 
 # Clef is a Cloudflare Workers AI decision model. The account id is part of the
 # run URL and is configuration; the API token is the credential. Both are read
@@ -120,63 +140,37 @@ def note_local_failure(exc: BaseException) -> bool:
         return _local_failure_count <= LOCAL_FALLBACK_FAILURE_LIMIT
 
 
-# The named arrangements, in the vocabulary the DOGA fork uses. Each name
-# resolves onto exactly one of the canonical route names above.
-MODE_ALIASES = {
-    "jev_api": "openrouter",
-    "laya_local": "laya",
-    "laya_with_jev_fallback": "laya_then_hosted",
-    "clef_api": "clef",
-    "clef_with_jev_fallback": "clef_then_jev",
-}
-MODE_NAMES = (
-    "jev_api",
-    "laya_local",
-    "laya_with_jev_fallback",
-    "clef_api",
-    "clef_with_jev_fallback",
-)
-PROVIDER_MODES = {
-    "openrouter": "jev_api",
-    "laya": "laya_local",
-    "laya_then_hosted": "laya_with_jev_fallback",
-    "clef": "clef_api",
-    "clef_then_jev": "clef_with_jev_fallback",
-}
-
-
-def resolve_provider(name: object) -> str:
-    """Map a mode name or a canonical route name onto the canonical route name.
-
-    Only the named arrangements are rewritten, and each is recognised in either
-    case. Any other value, including a canonical route name, is returned
-    unchanged so the existing validation still decides whether it is valid.
-    """
-    if not isinstance(name, str):
-        return ""
-    candidate = name.strip()
-    return MODE_ALIASES.get(candidate, MODE_ALIASES.get(candidate.lower(), candidate))
-
-
-def provider_mode(provider: str) -> str:
-    """The named arrangement for a canonical route name."""
-    canonical = resolve_provider(provider)
-    if canonical not in PROVIDER_MODES:
-        raise ValueError("invalid provider")
-    return PROVIDER_MODES[canonical]
-
-
+# The hosted providers. They are not renamed by the four-mode contract: the mode
+# names the API as one side, and which hosted model answers it stays its own
+# individually selectable choice, exactly as it was before.
 HOSTED_PROVIDERS = ("openrouter", "clef")
+# The local slot. The provider name stays ``laya``; ``local_model`` selects the
+# engine behind it, so a different local model needs no new provider name.
 LOCAL_PROVIDERS = ("laya",)
-CHAINED_PROVIDER = "laya_then_hosted"
-CLEF_CHECKPOINT_PROVIDER = "clef"
-CLEF_CHAINED_PROVIDER = "clef_then_jev"
-PROVIDER_NAMES = (
-    ("auto",)
-    + HOSTED_PROVIDERS
-    + LOCAL_PROVIDERS
-    + (CHAINED_PROVIDER, CLEF_CHAINED_PROVIDER)
+# The name of the local provider, used by the chain to tell its local hop from a
+# hosted one.
+LOCAL_PROVIDER = "laya"
+
+# The four canonical mode names. They are the only names a diagnostic, a log
+# line, or a config entry should ever carry: every alias resolves onto one of
+# them before it reaches a chain, a URL, or an error message.
+API_WITH_LOCAL_FALLBACK = "api_with_local_fallback"
+API_ONLY = "api_only"
+LOCAL_ONLY = "local_only"
+LOCAL_WITH_API_FALLBACK = "local_with_api_fallback"
+CANONICAL_MODES = (
+    API_WITH_LOCAL_FALLBACK,
+    API_ONLY,
+    LOCAL_ONLY,
+    LOCAL_WITH_API_FALLBACK,
 )
+
+# The modes that promise a fallback and therefore fail at load when the other
+# side has no usable provider. Both names are carried in a failure message.
+FALLBACK_MODES = (API_WITH_LOCAL_FALLBACK, LOCAL_WITH_API_FALLBACK)
+# The modes that call one provider and report its failure rather than rerouting.
+SINGLE_PROVIDER_MODES = (API_ONLY, LOCAL_ONLY)
+
 PROVIDER_ENV = {
     "openrouter": "OPENROUTER_API_KEY",
     "laya": "LAYA_API_KEY",
@@ -186,7 +180,139 @@ PROVIDER_ENV = {
 # when both are present.
 PROVIDER_REQUIRED_ENV = {"clef": (CLEF_TOKEN_ENV, CLEF_ACCOUNT_ENV)}
 DEFAULT_FALLBACK_ORDER = ("openrouter",)
-LOCAL_PROVIDER = "laya"
+
+# Every name that resolves to a canonical mode. Each entry is either one of the
+# four canonical names, a pre-existing arrangement name, or a pre-existing
+# canonical route name. Nothing is removed, so no deployed configuration breaks.
+#
+# The pre-existing names are grouped by the canonical mode they denote, and the
+# table is documented in docs/reference.md:
+#
+# - ``api_with_local_fallback``: ``clef_with_local_fallback``. This mode is new to
+#   this repository: v1.3.0 had no hosted-first chain, because both of its chains
+#   were local-first or hosted-only. A hosted provider reached this mode only by
+#   naming the chain explicitly, so the legacy hosted provider names keep
+#   resolving to ``api_only``, which is exactly what they selected before.
+# - ``api_only``: ``openrouter``, ``jev_api``, ``clef``, ``clef_api``, and
+#   ``auto``. Each of these named one hosted provider and reported its failure
+#   without rerouting, so each keeps meaning one hosted provider and no fallback.
+# - ``local_only``: ``laya``, ``laya_local``.
+# - ``local_with_api_fallback``: ``laya_then_hosted``,
+#   ``laya_with_jev_fallback``, ``clef_then_jev``,
+#   ``clef_with_jev_fallback``.
+#
+# ``clef_then_jev`` is a hosted-only chain in v1.3.0: Clef first, then hosted
+# Jev. It is not one of the four canonical modes, because both sides it chains are
+# hosted. It is kept as an alias of ``local_with_api_fallback`` so that an entry
+# storing it keeps routing the same way, Clef first and hosted Jev behind it, and
+# ``_clef_pinned_mode`` keeps the Clef lead that the mode name alone cannot
+# express. That is the one place this repository's vocabulary does not map
+# cleanly onto the shared four-mode shape, and preserving the routing is what
+# backwards compatibility requires.
+#
+# ``auto`` is dynamic: it resolves to ``api_only`` when no usable local model is
+# configured and to ``api_with_local_fallback`` when one is, which is what
+# ``resolve_auto_mode`` decides. It is mapped to ``api_only`` here so that a
+# lookup of the mode constant is total, and ``PROVIDER_MODES["auto"]`` carries
+# the same fallback.
+MODE_ALIASES = {
+    # hosted API leading, local slot behind it
+    API_WITH_LOCAL_FALLBACK: API_WITH_LOCAL_FALLBACK,
+    "clef_with_local_fallback": API_WITH_LOCAL_FALLBACK,
+    # ``auto`` is dynamic rather than a fixed alias: see ``resolve_auto_mode``.
+    "auto": API_ONLY,
+    # the hosted API alone. Each name pins one hosted provider, which is how
+    # each of them behaved before the four-mode contract: a single provider
+    # whose failure is reported and never rerouted.
+    API_ONLY: API_ONLY,
+    "openrouter": API_ONLY,
+    "jev_api": API_ONLY,
+    "clef": API_ONLY,
+    "clef_api": API_ONLY,
+    # the local slot alone
+    LOCAL_ONLY: LOCAL_ONLY,
+    "laya": LOCAL_ONLY,
+    "laya_local": LOCAL_ONLY,
+    # the local slot leading, the hosted API behind it
+    LOCAL_WITH_API_FALLBACK: LOCAL_WITH_API_FALLBACK,
+    "laya_then_hosted": LOCAL_WITH_API_FALLBACK,
+    "laya_with_jev_fallback": LOCAL_WITH_API_FALLBACK,
+    "clef_then_jev": LOCAL_WITH_API_FALLBACK,
+    "clef_with_jev_fallback": LOCAL_WITH_API_FALLBACK,
+}
+MODE_NAMES = CANONICAL_MODES
+
+# The canonical mode for a name. Every alias above is listed here too, so the
+# reverse lookup is total and neither table can name a mode the other does not.
+PROVIDER_MODES = {
+    API_WITH_LOCAL_FALLBACK: API_WITH_LOCAL_FALLBACK,
+    API_ONLY: API_ONLY,
+    LOCAL_ONLY: LOCAL_ONLY,
+    LOCAL_WITH_API_FALLBACK: LOCAL_WITH_API_FALLBACK,
+    "clef_with_local_fallback": API_WITH_LOCAL_FALLBACK,
+    "auto": API_ONLY,
+    "openrouter": API_ONLY,
+    "jev_api": API_ONLY,
+    "clef": API_ONLY,
+    "clef_api": API_ONLY,
+    "laya": LOCAL_ONLY,
+    "laya_local": LOCAL_ONLY,
+    "laya_then_hosted": LOCAL_WITH_API_FALLBACK,
+    "laya_with_jev_fallback": LOCAL_WITH_API_FALLBACK,
+    "clef_then_jev": LOCAL_WITH_API_FALLBACK,
+    "clef_with_jev_fallback": LOCAL_WITH_API_FALLBACK,
+}
+
+# The mode names this repository shipped before the four-mode contract, kept as
+# names so a caller that imports them still works. ``CHAINED_PROVIDER`` was the
+# local-first chain and ``CLEF_CHAINED_PROVIDER`` the Clef-first chain; both now
+# denote ``local_with_api_fallback``.
+CHAINED_PROVIDER = "laya_then_hosted"
+CLEF_CHAINED_PROVIDER = "clef_then_jev"
+# ``clef`` is both a hosted provider name and the Clef checkpoint provider, as
+# it was in v1.3.0. The two are the same string here.
+CLEF_CHECKPOINT_PROVIDER = "clef"
+# Every accepted name, canonical mode or alias. An unknown name is refused with
+# a message that names every mode and alias the caller may use.
+PROVIDER_NAMES = tuple(MODE_ALIASES)
+
+
+def accepted_provider_names() -> str:
+    """Every accepted name, for an error message that must not hide them."""
+    return ", ".join(sorted(PROVIDER_NAMES))
+
+
+def resolve_provider(name: object) -> str:
+    """Map a mode name or a legacy route name onto one of the four modes.
+
+    Every name in ``MODE_ALIASES`` is rewritten onto the canonical mode it
+    denotes, so no alias string reaches a chain, a diagnostic, a log line, or a
+    URL. Any other value is returned unchanged so the existing validation still
+    decides whether it is valid.
+
+    Case handling is unchanged from v1.3.0: the arrangement names and the four
+    canonical mode names are recognised in either case, and the canonical route
+    names are matched exactly as they were, so a value like ``Laya`` is still
+    refused rather than newly accepted.
+    """
+    if not isinstance(name, str):
+        return ""
+    candidate = name.strip()
+    if candidate in MODE_ALIASES:
+        return MODE_ALIASES[candidate]
+    folded = candidate.lower()
+    if folded in CASE_INSENSITIVE_ALIASES:
+        return MODE_ALIASES[folded]
+    return candidate
+
+
+def provider_mode(provider: str) -> str:
+    """The canonical mode for a name, accepted as either a mode or an alias."""
+    canonical = resolve_provider(provider)
+    if canonical not in PROVIDER_MODES:
+        raise ValueError("invalid provider: " + accepted_provider_names())
+    return PROVIDER_MODES[canonical]
+
 
 _SECRET_TEXT = re.compile(
     r"(?i)(api[_ -]?key|token|password|secret|credential)(\s*[:=]\s*)[^\s,;]+"
@@ -409,11 +535,48 @@ def decision_from_body(body: dict, *, model: str = MODEL) -> Decision:
     )
 
 
+def local_checkpoint(model: object = None) -> str:
+    """The local engine or checkpoint name to ask the local server for.
+
+    ``laya`` is the default and the existing default path is unchanged, so an
+    entry that stored nothing keeps calling Laya. Any other name is accepted,
+    which is the point: the local slot is interchangeable with any other local
+    System One decision model that publishes the same ``/v1/systemone``
+    contract, and a new one must work by configuration alone rather than by a
+    code change. So there is no allowlist of model names here. What is
+    rejected is a value that cannot be a name at all: empty or whitespace-only
+    text, a value that is not text, and a value carrying a control character, a
+    quote, a backslash, whitespace, or the URL delimiters ``?``, ``#``, and
+    ``&``, any of which would corrupt the JSON body or a URL path segment.
+    """
+    if model is None:
+        return LOCAL_MODEL
+    if not isinstance(model, str):
+        raise ValueError("invalid local_model: expected a model name")
+    candidate = model.strip()
+    if not candidate:
+        raise ValueError("invalid local_model: the name is empty")
+    if not _LOCAL_MODEL_SHAPE.match(candidate):
+        raise ValueError(
+            "invalid local_model: expected a model name built from letters,"
+            " digits, '.', '_', ':', '+', '-', and '/', starting with a letter"
+            " or a digit"
+        )
+    return candidate
+
+
 class OpenRouterJev:
     """Hosted Jev over an OpenRouter API key."""
 
     def __init__(self, api_key: str | None = None, *, timeout: float = 30.0) -> None:
-        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        # An explicitly supplied value wins over the environment, including a
+        # value that is present but empty: an empty credential is a missing
+        # credential, so it is never topped up from the process environment.
+        # ``None`` means "read the environment", which is what a caller with no
+        # value of its own passes.
+        self.api_key = (
+            api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY")
+        )
         self.timeout = timeout
 
     def decide(self, state: dict[str, Any]) -> Decision:
@@ -740,13 +903,15 @@ def laya_endpoint(
 
 
 class LayaJev:
-    """A local ``laya-serve`` process, over the same Decisions contract.
+    """A local decision-model server, over the same Decisions contract.
 
-    Laya is not a hosted Jev endpoint. It is a separate model that publishes
-    ``POST /v1/systemone`` and answers in the same ``answers`` shape, so
-    selecting it replaces the hosted route instead of extending it. The route is
-    keyless: the ``Authorization`` header is omitted entirely unless the server
-    was started with its own bearer check.
+    The local slot is generic. It is not a hosted Jev endpoint, and it is not
+    bound to one model either: it publishes ``POST /v1/systemone`` and answers
+    in the same ``answers`` shape, so Laya, Kev, Tev1, or a jeff checkpoint are
+    selected by the ``model`` argument, which is the value ``local_model``
+    supplies, rather than by a different provider name. The route is keyless: the
+    ``Authorization`` header is omitted entirely unless the server was started
+    with its own bearer check.
     """
 
     def __init__(
@@ -754,12 +919,12 @@ class LayaJev:
         base_url: str = LAYA_BASE_URL,
         *,
         endpoint_path: str = LAYA_ENDPOINT_PATH,
-        model: str = LAYA_MODEL,
+        model: str | None = LAYA_MODEL,
         api_key: str | None = None,
         timeout: float = LAYA_TIMEOUT,
     ) -> None:
         self.endpoint = laya_endpoint(base_url, endpoint_path)
-        self.model = model
+        self.model = local_checkpoint(model)
         self.api_key = (
             api_key if api_key is not None else os.environ.get("LAYA_API_KEY")
         )
@@ -876,8 +1041,10 @@ def validate_fallback_order(order: tuple[str, ...] | list[str]) -> tuple[str, ..
     """Accept a hosted provider order, and reject every other name.
 
     A member of the order is a hosted provider. The local provider is not one,
-    because it is a route of its own, and neither is a route name such as
-    ``laya_then_hosted``, which would be a chain inside a chain.
+    because it is a slot of its own and the local side is never a member of the
+    hosted order, and neither is a mode name such as ``local_with_api_fallback``,
+    which would be a chain inside a chain. ``local_model`` is rejected here too,
+    so a model name can never be appended to a fallback order.
     """
     if (
         not order
@@ -888,58 +1055,206 @@ def validate_fallback_order(order: tuple[str, ...] | list[str]) -> tuple[str, ..
     return tuple(order)
 
 
+def local_model_configured(local_model: object = None) -> bool:
+    """Whether the caller has explicitly selected a local decision model.
+
+    This is the ``auto`` mode's notion of "a usable local model is
+    configured". The local slot's URL and model are settings rather than
+    credentials, and the local server's reachability cannot be known at load
+    time, so the only honest signal that an operator wants the local side in
+    play is that they named a model for it. A caller who passes nothing keeps
+    the v1.3.0 behaviour of ``auto``, which never put the local slot in the
+    order on its own initiative.
+    """
+    return local_model is not None
+
+
+def resolve_auto_mode(
+    *, env: Mapping[str, str] | None = None, local_model: object = None
+) -> str:
+    """The canonical mode ``auto`` denotes in this configuration.
+
+    ``auto`` resolves to ``api_with_local_fallback`` when a local model has
+    been explicitly configured, and to ``api_only`` otherwise. That preserves
+    what ``auto`` meant in v1.3.0, which was "the hosted providers that are
+    configured", while giving the local side a place behind the API once an
+    operator asks for it by name.
+    """
+    return API_WITH_LOCAL_FALLBACK if local_model_configured(local_model) else API_ONLY
+
+
+# The names that pin the hosted side to Clef rather than letting the hosted
+# order choose. ``clef_with_local_fallback`` is the Clef-pinned form of the
+# hosted-first mode, and ``clef_then_jev`` and ``clef_with_jev_fallback`` are the
+# two spellings of the Clef-first chain, which the mode name alone cannot
+# express because both of its hops are hosted.
+CLEF_PINNED_NAMES = (
+    "clef",
+    "clef_api",
+    "clef_with_local_fallback",
+    "clef_then_jev",
+    "clef_with_jev_fallback",
+)
+
+# The names recognised in either case. In v1.3.0 this was the set of
+# arrangement names, and it is that same set plus the four canonical mode names.
+# The canonical route names are deliberately not in it: they were matched
+# exactly before this change and stay matched exactly, so `provider_order("Laya")`
+# still raises rather than silently becoming the local mode.
+CASE_INSENSITIVE_ALIASES = frozenset(
+    set(CANONICAL_MODES)
+    | {
+        "jev_api",
+        "laya_local",
+        "laya_with_jev_fallback",
+        "clef_api",
+        "clef_with_jev_fallback",
+    }
+)
+
+
+def pins_clef(provider: object) -> bool:
+    """Whether a stored name pins the hosted side to Clef rather than the order.
+
+    The config entry module and the config flow need this because they must
+    decide which credential an entry may contribute *before* the name is
+    resolved, and resolution collapses a Clef-pinned name and a Jev-pinned name
+    onto one canonical mode. A mode name alone cannot express the Clef lead, so
+    it has to be read off the stored spelling.
+    """
+    return isinstance(provider, str) and provider.strip().lower() in (CLEF_PINNED_NAMES)
+
+
+def _clef_pinned_mode(provider: str) -> bool:
+    """Whether the name pins the hosted side to Clef rather than the order."""
+    return pins_clef(provider)
+
+
 def provider_order(
     provider: str = "auto",
     *,
     fallback_order: tuple[str, ...] | list[str] = DEFAULT_FALLBACK_ORDER,
     env: dict[str, str] | None = None,
+    local_model: object = None,
 ) -> list[str]:
-    """Resolve the providers a configured route may call, in order."""
-    provider = resolve_provider(provider)
-    if provider not in PROVIDER_NAMES:
-        raise ValueError("invalid provider")
+    """Resolve the providers a configured mode may call, in order.
+
+    The order is a provider sequence, not a mode name: the local slot answers
+    under the single name ``laya`` whatever engine ``local_model`` selects,
+    because the engine is a checkpoint of that slot rather than a provider of
+    its own. An empty order is returned rather than raised, so ``build_provider``
+    can turn "nothing is configured" into its own error, exactly as before.
+    """
+    mode = resolve_provider(provider)
+    if mode not in PROVIDER_MODES:
+        raise ValueError("invalid provider: " + accepted_provider_names())
     order = validate_fallback_order(fallback_order)
-    if provider == LOCAL_PROVIDER:
+    if mode == LOCAL_ONLY:
+        # The local slot stands in place of the hosted API, so this mode has no
+        # chain to fall through and no credential to find.
         return [LOCAL_PROVIDER]
     source = os.environ if env is None else env
     configured = {name: _configured(name, source) for name in HOSTED_PROVIDERS}
-    if provider == CHAINED_PROVIDER:
-        # The chain starts on the local server, so it needs at least one hosted
-        # hop behind it. Without a configured hosted provider there is no
-        # fallback to route to, and returning the local hop alone would silently
-        # turn the chained route into the local-only route.
-        hosted = [name for name in order if configured[name]]
+    hosted = [name for name in order if configured[name]]
+    if provider.strip().lower() == "auto":
+        # ``auto`` builds the hosted order from the providers that are
+        # configured, and adds the local slot behind them only once a local
+        # model has been explicitly configured. It never raises on a missing
+        # credential: an empty order is what says nothing is configured, so
+        # naming a local model does not by itself make a hosted-first mode
+        # usable. That preserves what ``auto`` meant before v1.4.0.
+        if not hosted:
+            return []
+        if resolve_auto_mode(env=source, local_model=local_model) == (
+            API_WITH_LOCAL_FALLBACK
+        ):
+            return [*hosted, LOCAL_PROVIDER]
+        return hosted
+    if mode == LOCAL_WITH_API_FALLBACK:
+        # The local slot leads, so it needs at least one hosted hop behind it.
+        # Without a configured hosted provider there is no fallback to route to,
+        # and returning the local hop alone would silently turn this mode into
+        # ``local_only``.
+        if _clef_pinned_mode(provider):
+            # A name that pins Clef first must actually call Clef, so the chain
+            # is led by it rather than by the order, and something must sit
+            # behind it for the same reason the local-first chain fails fast.
+            if not configured[CLEF_CHECKPOINT_PROVIDER]:
+                raise ValueError("missing " + _missing_names(CLEF_CHECKPOINT_PROVIDER))
+            behind = [name for name in hosted if name != CLEF_CHECKPOINT_PROVIDER]
+            if not behind:
+                raise ValueError(
+                    "no configured hosted provider behind Clef for the "
+                    + CLEF_CHAINED_PROVIDER
+                    + " route"
+                )
+            return [CLEF_CHECKPOINT_PROVIDER, *behind]
         if not hosted:
             raise ValueError(
                 "missing "
                 + " or ".join(PROVIDER_ENV[name] for name in order)
                 + " for the "
-                + CHAINED_PROVIDER
-                + " route"
+                + LOCAL_WITH_API_FALLBACK
+                + " mode"
             )
-        return [LOCAL_PROVIDER] + hosted
-    if provider == CLEF_CHAINED_PROVIDER:
-        # Clef first, then the hosted order behind it. Clef itself must be
-        # configured, and a configured hop must exist behind it.
-        if not configured[CLEF_CHECKPOINT_PROVIDER]:
-            raise ValueError("missing " + _missing_names(CLEF_CHECKPOINT_PROVIDER))
-        hosted = [
-            name
-            for name in order
-            if name != CLEF_CHECKPOINT_PROVIDER and configured[name]
-        ]
+        return [LOCAL_PROVIDER, *hosted]
+    if mode == API_WITH_LOCAL_FALLBACK:
+        # The hosted API leads and the local slot stands behind it, so a case
+        # costs no local request while a hosted provider answers. With no
+        # configured hosted provider there is nothing to lead with, so this
+        # fails fast rather than quietly answering from the local slot under the
+        # name of a hosted-first mode.
+        if _clef_pinned_mode(provider):
+            # A Clef-pinned hosted-first mode leads with Clef and puts the local
+            # slot directly behind it. The rest of the hosted order is not
+            # dragged in: a name that pins Clef says which provider leads.
+            if not configured[CLEF_CHECKPOINT_PROVIDER]:
+                raise ValueError("missing " + _missing_names(CLEF_CHECKPOINT_PROVIDER))
+            return [CLEF_CHECKPOINT_PROVIDER, LOCAL_PROVIDER]
         if not hosted:
             raise ValueError(
-                "no configured hosted provider behind Clef for the "
-                + CLEF_CHAINED_PROVIDER
-                + " route"
+                "missing "
+                + " or ".join(PROVIDER_ENV[name] for name in order)
+                + " for the "
+                + API_WITH_LOCAL_FALLBACK
+                + " mode"
             )
-        return [CLEF_CHECKPOINT_PROVIDER, *hosted]
-    if provider == "auto":
-        return [name for name in order if configured[name]]
-    if not configured[provider]:
-        raise ValueError("missing " + _missing_names(provider))
-    return [provider]
+        return [*hosted, LOCAL_PROVIDER]
+    # ``api_only``. A name that pins one hosted provider is served by that
+    # provider; the bare mode is served by the first configured hosted provider
+    # in the order. A failure on this mode is reported and never rerouted.
+    if _clef_pinned_mode(provider):
+        if not configured[CLEF_CHECKPOINT_PROVIDER]:
+            raise ValueError("missing " + _missing_names(CLEF_CHECKPOINT_PROVIDER))
+        return [CLEF_CHECKPOINT_PROVIDER]
+    # ``openrouter`` and ``jev_api`` pin OpenRouter, so a selection naming one
+    # is served by OpenRouter even when another hosted provider is configured.
+    # This is unchanged from v1.3.0, where the same names returned exactly
+    # ``["openrouter"]`` or raised naming OPENROUTER_API_KEY.
+    if provider.strip().lower() in ("openrouter", "jev_api"):
+        if not configured["openrouter"]:
+            raise ValueError("missing " + _missing_names("openrouter"))
+        return ["openrouter"]
+    if not hosted:
+        # The mode's own name is used here, so the message names the variable a
+        # caller must set rather than a route name that may be an alias.
+        raise ValueError(
+            "missing "
+            + " or ".join(PROVIDER_ENV[name] for name in order)
+            + " for the "
+            + API_ONLY
+            + " mode"
+        )
+    return hosted[:1]
+
+
+def _missing_names(name: str) -> str:
+    """The variable names a provider needs, for a failure message.
+
+    A provider with one required variable is named by it. Clef has two, and
+    both are named so a misconfiguration is visible without reading the source.
+    """
+    return " and ".join(PROVIDER_REQUIRED_ENV.get(name, (PROVIDER_ENV[name],)))
 
 
 def _hosted_adapter(
@@ -948,11 +1263,14 @@ def _hosted_adapter(
     timeout: float | None,
     env: dict[str, str],
     clef_model: str = CLEF_DEFAULT_MODEL,
-) -> "OpenRouterJev | ClefJev":
+):
     """Build the adapter for one hosted provider name."""
     if name == "openrouter":
         return OpenRouterJev(api_key, timeout=30.0 if timeout is None else timeout)
     if name == CLEF_CHECKPOINT_PROVIDER:
+        # The token and the account id stay in the environment. A caller that
+        # holds them itself can pass them in, and an explicit value wins over
+        # the environment exactly as it does for the other hosted providers.
         return ClefJev(
             api_key,
             model=clef_model,
@@ -969,37 +1287,75 @@ def build_provider(
     laya_base_url: str = LAYA_BASE_URL,
     laya_model: str = LAYA_MODEL,
     clef_model: str = CLEF_DEFAULT_MODEL,
+    local_model: object = None,
     timeout: float | None = None,
     fallback_order: tuple[str, ...] | list[str] = DEFAULT_FALLBACK_ORDER,
     env: dict[str, str] | None = None,
-) -> "OpenRouterJev | ClefJev | LayaJev | ChainedJev":
-    """Build the adapter for the configured route.
+):
+    """Build the adapter for the configured mode.
 
-    On the chained routes ``api_key`` is the OpenRouter hosted key and the local
-    hop keeps its own optional ``LAYA_API_KEY``. An explicit hosted key also
-    supplies the key for the route check, so a caller that holds the key in its
-    own configuration does not need it in the environment as well.
+    ``api_key`` is the hosted key for every mode whose API side is hosted, and
+    also for the modes whose local slot leads, whose local hop keeps its own
+    optional ``LAYA_API_KEY``. On ``local_only`` it is the optional token for a
+    local server started with its own bearer check; when it is absent the
+    request carries no ``Authorization`` header. An explicit key also supplies
+    the hosted credential for the mode check, so a caller that holds the key in
+    its own configuration does not need it in the environment as well.
+
+    ``local_model`` selects which local decision model answers. It takes
+    precedence over the pre-existing ``laya_model`` when it is set, because the
+    local slot is a generic slot and the old field is the deprecated spelling of
+    the same setting. ``laya_model`` is still accepted, and an entry that stored
+    only ``laya_model`` keeps calling that checkpoint.
     """
     source = dict(os.environ if env is None else env)
-    provider = resolve_provider(provider)
-    if api_key and provider != LOCAL_PROVIDER:
+    mode = resolve_provider(provider)
+    if api_key and mode != LOCAL_ONLY:
         source[PROVIDER_ENV["openrouter"]] = api_key
-    order = provider_order(provider, fallback_order=fallback_order, env=source)
+    order = provider_order(
+        provider,
+        fallback_order=fallback_order,
+        env=source,
+        local_model=local_model,
+    )
     if not order:
         raise RuntimeError(
-            "no Jev provider is configured: add an OpenRouter key"
+            "no Jev provider is configured: set OPENROUTER_API_KEY"
             " or select the local Laya provider"
         )
-    if provider == LOCAL_PROVIDER:
+    # ``local_model`` wins when it is set, and ``laya_model`` is the deprecated
+    # spelling that still works. Resolving it here means one validation of the
+    # name, at build time, rather than a name that reaches the wire unvalidated.
+    checkpoint = local_checkpoint(laya_model if local_model is None else local_model)
+    if mode == LOCAL_ONLY:
         return LayaJev(
             laya_base_url,
-            model=laya_model,
+            model=checkpoint,
             api_key=api_key,
             timeout=LAYA_TIMEOUT if timeout is None else timeout,
         )
-    if provider == CLEF_CHAINED_PROVIDER:
-        return ChainedJev(
-            [
+    if len(order) > 1:
+        # Both fallback modes are two-provider chains, and the pre-existing
+        # Clef-first chain is one of them. The order decides which adapter is
+        # tried first, so the same construction serves the local-first chain and
+        # the hosted-first chain.
+        chain = []
+        for name in order:
+            if name == LOCAL_PROVIDER:
+                # The local hop needs no hosted key, so ``api_key`` belongs to
+                # the hosted hops only.
+                chain.append(
+                    (
+                        name,
+                        LayaJev(
+                            laya_base_url,
+                            model=checkpoint,
+                            timeout=LAYA_TIMEOUT if timeout is None else timeout,
+                        ),
+                    )
+                )
+                continue
+            chain.append(
                 (
                     name,
                     _hosted_adapter(
@@ -1010,31 +1366,8 @@ def build_provider(
                         clef_model,
                     ),
                 )
-                for name in order
-            ]
-        )
-    if order[0] == LOCAL_PROVIDER:
-        # The local-first chain. The local hop comes first and needs no hosted
-        # key, so ``api_key`` belongs to the hosted hops only.
-        local = LayaJev(
-            laya_base_url,
-            model=laya_model,
-            timeout=LAYA_TIMEOUT if timeout is None else timeout,
-        )
-        hosted = [
-            (
-                name,
-                _hosted_adapter(
-                    name,
-                    source.get(PROVIDER_ENV[name]) or None,
-                    timeout,
-                    source,
-                    clef_model,
-                ),
             )
-            for name in order[1:]
-        ]
-        return ChainedJev([(LOCAL_PROVIDER, local), *hosted])
+        return ChainedJev(chain)
     return _hosted_adapter(
         order[0],
         source.get(PROVIDER_ENV[order[0]]) or None,

@@ -53,6 +53,22 @@ LAYA_MODEL = "convaiinnovations/laya"
 LAYA_TIMEOUT = 120.0
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
 
+# The local route is a generic local decision-model slot. The provider name in
+# configuration stays ``laya``; ``local_model`` is the engine or checkpoint name
+# the local server is asked for, and it is interchangeable with any other model
+# that publishes the same ``/v1/systemone`` contract.
+LOCAL_MODEL = "laya"
+# The stored config-entry field that selects the local engine. It lives beside
+# the Clef checkpoint field so the form and the entry builder cannot drift.
+LOCAL_MODEL_FIELD = "local_model"
+# The shape a local model name may take. This is deliberately a character
+# shape and not a list of model names: a local model published after this
+# release must work by configuration alone, with no code change. It rejects
+# empty and whitespace-only values, control characters, quotes and backslashes
+# that would corrupt a JSON string, and the URL delimiters ``?``, ``#``, and
+# ``&`` that would corrupt a path segment if the value is ever placed in one.
+_LOCAL_MODEL_SHAPE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:+/-]*\Z")
+
 # Clef is a Cloudflare Workers AI decision model, so its endpoint is per account
 # and the account id is part of the URL rather than an optional setting. The
 # account id is configuration; the API token is the credential. Both are read
@@ -320,11 +336,48 @@ def decision_from_body(body: dict, *, model: str = MODEL) -> Decision:
     )
 
 
+def local_checkpoint(model: object = None) -> str:
+    """The local engine or checkpoint name to ask the local server for.
+
+    ``laya`` is the default and the existing default path is unchanged, so an
+    entry that stored nothing keeps calling Laya. Any other name is accepted,
+    which is the point: the local slot is interchangeable with any other local
+    System One decision model that publishes the same ``/v1/systemone``
+    contract, and a new one must work by configuration alone rather than by a
+    code change. So there is no allowlist of model names here. What is
+    rejected is a value that cannot be a name at all: empty or whitespace-only
+    text, a value that is not text, and a value carrying a control character, a
+    quote, a backslash, whitespace, or the URL delimiters ``?``, ``#``, and
+    ``&``, any of which would corrupt the JSON body or a URL path segment.
+    """
+    if model is None:
+        return LOCAL_MODEL
+    if not isinstance(model, str):
+        raise ValueError("invalid local_model: expected a model name")
+    candidate = model.strip()
+    if not candidate:
+        raise ValueError("invalid local_model: the name is empty")
+    if not _LOCAL_MODEL_SHAPE.match(candidate):
+        raise ValueError(
+            "invalid local_model: expected a model name built from letters,"
+            " digits, '.', '_', ':', '+', '-', and '/', starting with a letter"
+            " or a digit"
+        )
+    return candidate
+
+
 class OpenRouterJev:
     """Hosted Jev over an OpenRouter API key."""
 
     def __init__(self, api_key: str | None = None, *, timeout: float = 30.0) -> None:
-        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        # An explicitly supplied value wins over the environment, including a
+        # value that is present but empty: an empty credential is a missing
+        # credential, so it is never topped up from the process environment.
+        # ``None`` means "read the environment", which is what a caller with no
+        # value of its own passes.
+        self.api_key = (
+            api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY")
+        )
         self.timeout = timeout
 
     def decide(self, state: dict) -> Decision:
@@ -674,14 +727,16 @@ def _cloudflare_error_detail(exc: HTTPError, *, limit: int = 2000) -> str:
 
 
 class LayaJev:
-    """A local ``laya-serve`` process, over the same Decisions contract.
+    """A local decision-model server, over the same Decisions contract.
 
-    Laya is not a hosted Jev endpoint. It is a separate model that publishes
-    ``POST /v1/systemone`` and answers in the same ``answers`` shape, so
-    selecting it replaces the hosted route instead of extending it. The route is
-    keyless: the ``Authorization`` header is omitted entirely unless the server
-    was started with its own bearer check, because an empty header is not the
-    same request as no header.
+    The local slot is generic. It is not a hosted Jev endpoint, and it is not
+    bound to one model either: it publishes ``POST /v1/systemone`` and answers
+    in the same ``answers`` shape, so Laya, Kev, Tev1, or a jeff checkpoint are
+    selected by the ``model`` argument, which is the value ``local_model``
+    supplies, rather than by a different provider name. The route is keyless: the
+    ``Authorization`` header is omitted entirely unless the server was started
+    with its own bearer check, because an empty header is not the same request
+    as no header.
     """
 
     def __init__(
@@ -689,12 +744,12 @@ class LayaJev:
         base_url: str = LAYA_BASE_URL,
         *,
         endpoint_path: str = LAYA_ENDPOINT_PATH,
-        model: str = LAYA_MODEL,
+        model: str | None = LAYA_MODEL,
         api_key: str | None = None,
         timeout: float = LAYA_TIMEOUT,
     ) -> None:
         self.endpoint = laya_endpoint(base_url, endpoint_path)
-        self.model = model
+        self.model = local_checkpoint(model)
         self.api_key = (
             api_key if api_key is not None else os.environ.get("LAYA_API_KEY")
         )

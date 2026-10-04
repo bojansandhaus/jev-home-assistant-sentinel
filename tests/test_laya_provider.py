@@ -18,7 +18,12 @@ from urllib.error import HTTPError, URLError
 import pytest
 
 from sentinel import (
+    API_ONLY,
+    API_WITH_LOCAL_FALLBACK,
+    CANONICAL_MODES,
+    CASE_INSENSITIVE_ALIASES,
     CHAINED_PROVIDER,
+    CLEF_PINNED_NAMES,
     CONFIDENCE_LEVELS,
     FALLBACK_STATUS_CODES,
     LAYA_BASE_URL,
@@ -26,7 +31,11 @@ from sentinel import (
     LAYA_MODEL,
     LAYA_TIMEOUT,
     LOCAL_FALLBACK_FAILURE_LIMIT,
+    LOCAL_MODEL,
+    LOCAL_MODEL_FIELD,
+    LOCAL_ONLY,
     LOCAL_PROVIDER,
+    LOCAL_WITH_API_FALLBACK,
     MODE_ALIASES,
     MODE_NAMES,
     PROVIDER_MODES,
@@ -40,11 +49,14 @@ from sentinel import (
     decision_questions,
     is_fallback_trigger,
     laya_endpoint,
+    local_checkpoint,
     local_failure_count,
+    local_model_configured,
     note_local_failure,
     provider_mode,
     provider_order,
     reset_local_failures,
+    resolve_auto_mode,
     resolve_provider,
     validate_fallback_order,
 )
@@ -185,7 +197,9 @@ def test_a_local_member_is_rejected_in_the_hosted_fallback_order():
             validate_fallback_order(order)
     with pytest.raises(ValueError, match="invalid fallback_order"):
         provider_order("laya", fallback_order=("openrouter", "laya"))
-    for name in ("local", "Laya", "typesafe"):
+    # ``laya`` is a legacy alias of ``local_only``, not an unknown name. A value
+    # that is neither a mode, an alias, nor a hosted provider is still refused.
+    for name in ("local", "Laya", "typesafe", "kev"):
         with pytest.raises(ValueError, match="invalid provider"):
             provider_order(name)
 
@@ -312,14 +326,22 @@ def test_the_runtime_bridge_carries_the_same_rules_as_the_package():
     assert _runtime.provider_order("laya") == ["laya"]
     assert _runtime.provider_order("auto", env={}) == []
     assert _runtime.CHAINED_PROVIDER == CHAINED_PROVIDER
-    assert _runtime.PROVIDER_NAMES == (
-        "auto",
-        "openrouter",
+    # Every accepted name, canonical mode or alias, in both copies.
+    assert _runtime.PROVIDER_NAMES == tuple(MODE_ALIASES)
+    assert _runtime.CANONICAL_MODES == CANONICAL_MODES
+    assert _runtime.API_WITH_LOCAL_FALLBACK == API_WITH_LOCAL_FALLBACK
+    assert _runtime.API_ONLY == API_ONLY
+    assert _runtime.LOCAL_ONLY == LOCAL_ONLY
+    assert _runtime.LOCAL_WITH_API_FALLBACK == LOCAL_WITH_API_FALLBACK
+    assert _runtime.CLEF_PINNED_NAMES == (
         "clef",
-        "laya",
-        CHAINED_PROVIDER,
+        "clef_api",
+        "clef_with_local_fallback",
         "clef_then_jev",
+        "clef_with_jev_fallback",
     )
+    assert _runtime.LOCAL_MODEL == LOCAL_MODEL == "laya"
+    assert _runtime.LOCAL_MODEL_FIELD == LOCAL_MODEL_FIELD == "local_model"
     assert _runtime.FALLBACK_STATUS_CODES == FALLBACK_STATUS_CODES
     assert _runtime.is_fallback_trigger(TimeoutError()) is True
     assert _runtime.is_fallback_trigger(_http_error(422)) is False
@@ -424,7 +446,9 @@ def test_the_runtime_bridge_chains_laya_then_hosted(monkeypatch):
 
 
 def test_the_runtime_bridge_chained_route_needs_a_hosted_key():
-    with pytest.raises(ValueError, match="for the laya_then_hosted route"):
+    # The bridge names the canonical mode in the failure message, exactly as the
+    # package copy does, so the two cannot drift on the observable text.
+    with pytest.raises(ValueError, match="for the local_with_api_fallback mode"):
         _runtime.build_provider(_runtime.CHAINED_PROVIDER, env={})
 
 
@@ -475,6 +499,9 @@ def test_the_chained_route_puts_the_local_server_first_and_the_hosted_key_behind
 
 
 def test_the_chained_route_fails_fast_without_a_hosted_key():
+    # The four-mode contract names the canonical mode in the failure message,
+    # because no alias string may leak into observable output. The message still
+    # names the variable that is missing, which is the part a caller acts on.
     for env in (
         {},
         {"LAYA_API_KEY": "private"},
@@ -483,11 +510,19 @@ def test_the_chained_route_fails_fast_without_a_hosted_key():
     ):
         with pytest.raises(
             ValueError,
-            match="missing OPENROUTER_API_KEY for the laya_then_hosted route",
+            match="missing OPENROUTER_API_KEY for the local_with_api_fallback mode",
         ):
             provider_order(CHAINED_PROVIDER, env=env)
+        # The canonical name and the two legacy spellings are the same failure.
+        for name in (LOCAL_WITH_API_FALLBACK, "laya_with_jev_fallback"):
+            with pytest.raises(
+                ValueError,
+                match="missing OPENROUTER_API_KEY for the local_with_api_fallback mode",
+            ):
+                provider_order(name, env=env)
     with pytest.raises(
-        ValueError, match="missing OPENROUTER_API_KEY for the laya_then_hosted route"
+        ValueError,
+        match="missing OPENROUTER_API_KEY for the local_with_api_fallback mode",
     ):
         build_provider(CHAINED_PROVIDER, env={"LAYA_API_KEY": "private"})
     with pytest.raises(ValueError, match="invalid provider"):
@@ -624,22 +659,32 @@ def test_a_chain_needs_more_than_one_provider():
         ChainedJev([("laya", LayaJev())])
 
 
-def test_the_config_flow_offers_the_chained_route_and_keeps_the_hosted_default():
+def test_the_config_flow_offers_the_four_modes_and_keeps_the_hosted_default():
     root = Path(__file__).parents[1] / "custom_components/jev_sentinel"
     integration = (root / "__init__.py").read_text()
     flow = (root / "config_flow.py").read_text()
     # An existing config entry without a provider field keeps the hosted route.
     assert 'DEFAULT_PROVIDER = "openrouter"' in integration
-    for name in ('"openrouter"', "LOCAL_PROVIDER", "CHAINED_PROVIDER"):
+    for name in ('"openrouter"', "LOCAL_ONLY", "LOCAL_WITH_API_FALLBACK"):
         assert name in flow
     assert "api_key_required" in flow
-    # The config flow offers every named arrangement and resolves the aliases
-    # onto the canonical routes before it validates the key. The set grew with
-    # Clef in v1.3.0; the three the earlier releases named are still offered.
+    # The form offers every canonical mode and every legacy alias, so an entry
+    # created by any earlier release is still selectable, and it resolves the
+    # stored name before it validates the key.
     for mode in MODE_NAMES:
         assert mode in flow
     for name in MODE_ALIASES:
         assert name in flow
+    # The local model is a free-text field on the form, not a list to choose
+    # from, because the whole point is that a new local model needs no code
+    # change.
+    assert "LOCAL_MODEL_FIELD" in flow
+    assert "local_checkpoint" in flow
+    assert "local_model_invalid" in flow
+    # The form still does not ask for a Cloudflare credential.
+    assert "CLOUDFLARE_API_TOKEN" not in flow.replace(
+        "``CLOUDFLARE_API_TOKEN``", ""
+    ).replace("``CLOUDFLARE_ACCOUNT_ID``", "")
     assert "resolve_provider" in flow
 
 
@@ -747,6 +792,20 @@ def _outcome(function, provider, env):
         return f"ValueError: {exc}"
 
 
+def _routing(function, provider, env):
+    """The routing decision only: a provider order, or the failure category.
+
+    Two names that resolve to the same mode must make the same routing decision.
+    The wording of a failure message is allowed to name the provider a caller
+    selected rather than the mode it resolved to, so this compares the decision
+    and not the text.
+    """
+    try:
+        return tuple(function(provider, env=env))
+    except ValueError as exc:
+        return f"ValueError: {type(exc).__name__}: {'missing' in str(exc)}"
+
+
 def _weak_answered(choice="ignore", score=0.0, action="none"):
     """A valid but weak local answer: low confidence, or a confident non-answer."""
     return {
@@ -763,36 +822,28 @@ def _weak_answered(choice="ignore", score=0.0, action="none"):
     }
 
 
-def test_the_named_arrangements_resolve_onto_their_routes():
-    # Clef arrived in v1.3.0 as a fourth hosted provider and a fifth arrangement,
-    # so the three the earlier releases pinned are now a subset of a larger set.
-    # Every assertion about them still holds; the new names are covered by
-    # tests/test_clef_provider.py and asserted here only as vocabulary.
-    assert MODE_NAMES == (
-        "jev_api",
-        "laya_local",
-        "laya_with_jev_fallback",
-        "clef_api",
-        "clef_with_jev_fallback",
+def test_the_four_canonical_modes_are_the_only_names_a_mode_reports():
+    # v1.4.0 replaces the five arrangement names with four canonical mode names.
+    # Every pre-existing name survives as an alias, and every assertion the
+    # earlier releases made about those names still holds, which is what the
+    # rest of this test proves.
+    assert MODE_NAMES == CANONICAL_MODES
+    assert CANONICAL_MODES == (
+        "api_with_local_fallback",
+        "api_only",
+        "local_only",
+        "local_with_api_fallback",
     )
-    assert MODE_ALIASES == {
-        "jev_api": "openrouter",
-        "laya_local": LOCAL_PROVIDER,
-        "laya_with_jev_fallback": CHAINED_PROVIDER,
-        "clef_api": "clef",
-        "clef_with_jev_fallback": "clef_then_jev",
-    }
-    assert PROVIDER_MODES == {
-        "openrouter": "jev_api",
-        LOCAL_PROVIDER: "laya_local",
-        CHAINED_PROVIDER: "laya_with_jev_fallback",
-        "clef": "clef_api",
-        "clef_then_jev": "clef_with_jev_fallback",
-    }
+    # Each alias resolves onto exactly one canonical mode, and the reverse table
+    # is total, so neither can name a mode the other does not.
     for alias, canonical in MODE_ALIASES.items():
+        assert canonical in CANONICAL_MODES, alias
+        assert PROVIDER_MODES[alias] == canonical, alias
         assert resolve_provider(alias) == canonical
-        assert resolve_provider(alias.upper()) == canonical
-        assert provider_mode(canonical) == alias
+        assert resolve_provider(f"  {alias}  ") == canonical
+        assert provider_mode(canonical) == canonical
+        if alias.lower() in CASE_INSENSITIVE_ALIASES:
+            assert resolve_provider(alias.upper()) == canonical, alias
         for env in (
             {},
             {"OPENROUTER_API_KEY": "private"},
@@ -803,9 +854,83 @@ def test_the_named_arrangements_resolve_onto_their_routes():
                 "CLOUDFLARE_ACCOUNT_ID": "private-account",
             },
         ):
+            if alias.lower() in CLEF_PINNED_NAMES:
+                # A Clef-pinned name carries routing the canonical mode name
+                # alone cannot express: it says which hosted provider leads.
+                # Its Clef-first routing is asserted in the tests below rather
+                # than here, because here it is not the same as the bare mode.
+                continue
+            if alias.lower() in ("openrouter", "jev_api"):
+                # These pin OpenRouter, and a selection naming one keeps the
+                # v1.3.0 message that names the provider rather than the mode,
+                # because the provider is what the caller has to supply. The
+                # routing itself is identical, which the comparison below would
+                # show if it compared the decision rather than the wording.
+                assert _routing(provider_order, alias, env) == _routing(
+                    provider_order, canonical, env
+                ), (alias, env)
+                continue
+            if alias == "auto":
+                # ``auto`` returns an empty order rather than raising when
+                # nothing is configured, and that is unchanged from v1.3.0.
+                # Its own resolution is asserted below.
+                continue
             assert _outcome(provider_order, alias, env) == _outcome(
                 provider_order, canonical, env
-            )
+            ), (alias, env)
+    assert set(MODE_ALIASES) == set(PROVIDER_MODES)
+    assert set(PROVIDER_MODES.values()) == set(CANONICAL_MODES)
+
+
+def test_every_legacy_name_still_resolves_to_the_same_routing():
+    """The backwards-compatibility table, one assertion per pre-existing name.
+
+    Each legacy name is paired with the canonical mode it now denotes and with
+    the provider order it produced before v1.4.0, so a configuration that
+    worked before this change produces the same routing decision after it.
+    """
+    legacy = {
+        # v1.1.0: the three original routes.
+        "jev_api": (API_ONLY, ["openrouter"]),
+        "openrouter": (API_ONLY, ["openrouter"]),
+        "laya": (LOCAL_ONLY, [LOCAL_PROVIDER]),
+        "laya_local": (LOCAL_ONLY, [LOCAL_PROVIDER]),
+        "laya_then_hosted": (
+            LOCAL_WITH_API_FALLBACK,
+            [LOCAL_PROVIDER, "openrouter"],
+        ),
+        "laya_with_jev_fallback": (
+            LOCAL_WITH_API_FALLBACK,
+            [LOCAL_PROVIDER, "openrouter"],
+        ),
+        # v1.3.0: the Clef routes.
+        "clef": (API_ONLY, ["clef"]),
+        "clef_api": (API_ONLY, ["clef"]),
+        "clef_then_jev": (LOCAL_WITH_API_FALLBACK, ["clef", "openrouter"]),
+        "clef_with_jev_fallback": (
+            LOCAL_WITH_API_FALLBACK,
+            ["clef", "openrouter"],
+        ),
+        # The mode that did not exist before v1.4.0.
+        "clef_with_local_fallback": (
+            API_WITH_LOCAL_FALLBACK,
+            ["clef", LOCAL_PROVIDER],
+        ),
+        # The default, which keeps meaning "the configured hosted providers"
+        # until a local model is named.
+        "auto": (API_ONLY, ["openrouter"]),
+    }
+    both = {
+        "CLOUDFLARE_API_TOKEN": "private",
+        "CLOUDFLARE_ACCOUNT_ID": "private-account",
+    }
+    for name, (canonical, expected) in legacy.items():
+        assert resolve_provider(name) == canonical, name
+        assert provider_mode(name) == canonical, name
+        assert provider_order(name, env={**both, "OPENROUTER_API_KEY": "k"}) == (
+            expected
+        ), name
+    # The legacy spellings still build the same adapter they always built.
     assert isinstance(
         build_provider("jev_api", api_key="private", env={}), OpenRouterJev
     )
@@ -813,28 +938,294 @@ def test_the_named_arrangements_resolve_onto_their_routes():
     chained = build_provider("laya_with_jev_fallback", api_key="private", env={})
     assert isinstance(chained, ChainedJev)
     assert chained.names == (LOCAL_PROVIDER, "openrouter")
-    assert resolve_provider("Laya") == "Laya"
-    assert resolve_provider("typesafe") == "typesafe"
+    clef_chain = build_provider(
+        "clef_with_jev_fallback", api_key="private", env={**both}
+    )
+    assert isinstance(clef_chain, ChainedJev)
+    assert clef_chain.names == ("clef", "openrouter")
+    # ``laya`` is a legacy alias of ``local_only`` and has been since v1.1.0, so
+    # it is checked above rather than listed here. The names the earlier releases
+    # rejected are still rejected, and the error now names every accepted mode
+    # and alias rather than hiding them.
+    for unknown in ("Laya", "typesafe", "laya_then_hosted_now", "kev"):
+        assert resolve_provider(unknown) == unknown
+        with pytest.raises(ValueError, match="invalid provider"):
+            provider_order(unknown)
+        with pytest.raises(ValueError, match="invalid provider"):
+            provider_mode(unknown)
     assert resolve_provider("") == ""
     assert resolve_provider(None) == ""
-    with pytest.raises(ValueError, match="invalid provider"):
-        provider_order("Laya")
-    with pytest.raises(ValueError, match="invalid provider"):
-        provider_mode("Laya")
-    with pytest.raises(ValueError, match="invalid provider"):
-        provider_mode("auto")
-    # A value that is not one of the three named arrangements is left alone, so
-    # the existing validation still rejects it exactly as before.
-    assert resolve_provider("Laya") == "Laya"
-    assert resolve_provider("typesafe") == "typesafe"
-    assert resolve_provider("") == ""
-    assert resolve_provider(None) == ""
-    with pytest.raises(ValueError, match="invalid provider"):
-        provider_order("Laya")
-    with pytest.raises(ValueError, match="invalid provider"):
-        provider_mode("Laya")
-    with pytest.raises(ValueError, match="invalid provider"):
-        provider_mode("auto")
+    for mode in CANONICAL_MODES:
+        with pytest.raises(ValueError, match="invalid provider"):
+            provider_mode(mode + "_now")
+
+
+def test_an_unknown_mode_is_refused_with_every_accepted_name_in_the_message():
+    with pytest.raises(ValueError) as raised:
+        provider_order("nonsense")
+    message = str(raised.value)
+    assert message.startswith("invalid provider: ")
+    for mode in CANONICAL_MODES:
+        assert mode in message
+    for alias in MODE_ALIASES:
+        assert alias in message
+    # Nothing but names: no credential, no state, and no candidate text.
+    assert "OPENROUTER_API_KEY" not in message
+    assert "CLOUDFLARE_API_TOKEN" not in message
+
+
+def test_auto_resolves_by_whether_a_local_model_is_configured():
+    # What ``auto`` meant in v1.3.0: the hosted providers that are configured,
+    # and never the local slot on its own initiative.
+    assert resolve_auto_mode() == API_ONLY
+    assert resolve_auto_mode(local_model=None) == API_ONLY
+    assert provider_order("auto", env={}) == []
+    assert provider_order("auto", env={"OPENROUTER_API_KEY": "private"}) == [
+        "openrouter"
+    ]
+    assert local_model_configured(None) is False
+    # Naming a local model is what puts the local slot behind the API, which is
+    # what ``api_with_local_fallback`` means.
+    assert resolve_auto_mode(local_model="kev") == API_WITH_LOCAL_FALLBACK
+    assert local_model_configured("kev") is True
+    assert provider_order(
+        "auto", env={"OPENROUTER_API_KEY": "private"}, local_model="kev"
+    ) == ["openrouter", LOCAL_PROVIDER]
+    # A local model with no hosted provider at all is still nothing configured.
+    # ``auto`` selects among the hosted providers, and naming a local model does
+    # not by itself make a hosted-first mode usable, so this preserves what
+    # ``auto`` meant before v1.4.0 rather than silently answering from the local
+    # slot under a hosted-first mode's name.
+    assert provider_order("auto", env={}, local_model="kev") == []
+    with pytest.raises(RuntimeError, match="no Jev provider is configured"):
+        build_provider("auto", env={}, local_model="kev")
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        (API_WITH_LOCAL_FALLBACK, ["openrouter", LOCAL_PROVIDER]),
+        (API_ONLY, ["openrouter"]),
+        (LOCAL_ONLY, [LOCAL_PROVIDER]),
+        (LOCAL_WITH_API_FALLBACK, [LOCAL_PROVIDER, "openrouter"]),
+    ],
+)
+def test_each_of_the_four_modes_resolves_to_its_provider_order(mode, expected):
+    assert provider_mode(mode) == mode
+    assert (
+        provider_order(
+            mode, env={"OPENROUTER_API_KEY": "private", "LAYA_API_KEY": "private"}
+        )
+        == expected
+    )
+
+
+def test_each_of_the_four_modes_builds_the_adapter_its_order_names():
+    env = {"OPENROUTER_API_KEY": "private"}
+    api_first = build_provider(API_WITH_LOCAL_FALLBACK, api_key="private", env={})
+    assert isinstance(api_first, ChainedJev)
+    assert api_first.names == ("openrouter", LOCAL_PROVIDER)
+    assert isinstance(api_first.providers[0][1], OpenRouterJev)
+    assert isinstance(api_first.providers[1][1], LayaJev)
+    assert isinstance(
+        build_provider(API_ONLY, api_key="private", env={}), OpenRouterJev
+    )
+    assert isinstance(build_provider(LOCAL_ONLY, env={}), LayaJev)
+    local_first = build_provider(LOCAL_WITH_API_FALLBACK, api_key="private", env={})
+    assert isinstance(local_first, ChainedJev)
+    assert local_first.names == (LOCAL_PROVIDER, "openrouter")
+    # The two ``_only`` modes are single-provider routes: one adapter, no chain,
+    # so a failure is reported and never rerouted.
+    for mode in (API_ONLY, LOCAL_ONLY):
+        assert len(provider_order(mode, env=env)) == 1
+
+
+def test_a_fallback_mode_with_no_provider_for_the_other_side_fails_at_load():
+    # Each mode promises a fallback, so each names the missing variable rather
+    # than degrading into the single-provider mode under another name.
+    with pytest.raises(ValueError, match="missing OPENROUTER_API_KEY"):
+        provider_order(LOCAL_WITH_API_FALLBACK, env={})
+    with pytest.raises(ValueError, match="missing OPENROUTER_API_KEY"):
+        provider_order(API_WITH_LOCAL_FALLBACK, env={})
+    with pytest.raises(ValueError, match="missing OPENROUTER_API_KEY"):
+        build_provider(API_WITH_LOCAL_FALLBACK, api_key="", env={})
+    # The two single-provider modes report instead of rerouting.
+    # ``api_only`` names the variable that is missing, in its own mode's name,
+    # because the mode's API side is the provider that is absent.
+    with pytest.raises(ValueError, match="missing OPENROUTER_API_KEY"):
+        provider_order(API_ONLY, env={})
+    # The names that pin OpenRouter did exactly the same before this change and
+    # still do.
+    for name in ("openrouter", "jev_api"):
+        with pytest.raises(ValueError, match="missing OPENROUTER_API_KEY"):
+            provider_order(name, env={})
+
+
+def test_local_model_selects_the_engine_and_the_default_is_unchanged():
+    # The default is unchanged: an entry that stored nothing still calls Laya.
+    assert LOCAL_MODEL == "laya"
+    assert LOCAL_MODEL_FIELD == "local_model"
+    assert local_checkpoint() == "laya"
+    assert local_checkpoint(None) == "laya"
+    assert local_checkpoint("  laya  ") == "laya"
+    assert build_provider(LOCAL_ONLY, env={}).model == LAYA_MODEL
+    assert build_provider(LOCAL_ONLY, env={}, laya_model=LAYA_MODEL).model == LAYA_MODEL
+    # A different engine is configuration, not a new provider, and not an
+    # allowlist: a model published after this release works by naming it.
+    for engine in (
+        "kev",
+        "kev-0.8b",
+        "tev1",
+        "Tev1-4B",
+        "Tev1-0.8B",
+        "jeff-qwen3.5-0.8b",
+        "jeff-gemma4-e2b",
+        "laya-multilingual",
+        "laya-typed-decisions",
+        "some-model-published-next-year",
+        "org/model:v2",
+    ):
+        assert local_checkpoint(engine) == engine, engine
+        provider = build_provider(LOCAL_ONLY, env={}, local_model=engine)
+        assert provider.model == engine, engine
+        # The provider name stays the local slot's single name.
+        assert provider_order(LOCAL_ONLY, env={}) == [LOCAL_PROVIDER]
+
+
+def test_local_model_changes_what_the_local_request_asks_for(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    for engine, expected in (
+        (None, LAYA_MODEL),
+        ("kev", "kev"),
+        ("tev1", "tev1"),
+    ):
+        seen = _capture(monkeypatch, sys.modules["sentinel.jev"], _answered(engine))
+        provider = build_provider(
+            LOCAL_ONLY, env={}, local_model=engine, laya_base_url=LAYA_BASE_URL
+        )
+        provider.decide({"case": {"event_type": "manual"}})
+        assert seen["payload"]["model"] == expected, engine
+        assert seen["url"] == LOCAL_URL
+
+
+def test_local_model_takes_precedence_over_the_deprecated_laya_model(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    # The deprecated field still works on its own, so an entry that stored only
+    # ``laya_model`` keeps calling that checkpoint.
+    assert build_provider(LOCAL_ONLY, env={}, laya_model="english").model == "english"
+    # When both are set, the current field wins. That precedence is documented
+    # in docs/reference.md.
+    assert (
+        build_provider(
+            LOCAL_ONLY, env={}, local_model="kev", laya_model="english"
+        ).model
+        == "kev"
+    )
+    # It is a local setting, so it never changes which provider answers.
+    assert provider_order(LOCAL_ONLY, env={}) == [LOCAL_PROVIDER]
+
+
+def test_the_local_model_reaches_the_chain_and_the_entry_builder(monkeypatch):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    chain = build_provider(
+        LOCAL_WITH_API_FALLBACK, api_key="private", env={}, local_model="tev1"
+    )
+    assert chain.names == (LOCAL_PROVIDER, "openrouter")
+    assert chain.providers[0][1].model == "tev1"
+    hosted_first = build_provider(
+        API_WITH_LOCAL_FALLBACK, api_key="private", env={}, local_model="tev1"
+    )
+    assert hosted_first.names == ("openrouter", LOCAL_PROVIDER)
+    assert hosted_first.providers[1][1].model == "tev1"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "   ",
+        "\t",
+        "\n",
+        "?",
+        "#",
+        "&",
+        "a?b",
+        "a#b",
+        "a&b",
+        'a"b',
+        "a\\b",
+        "a\x00b",
+        "a b",
+        "a/b/c d",
+        "-laya",
+        ".laya",
+        "a|b",
+        "a<b>",
+        "a{b}",
+        "a^b",
+    ],
+)
+def test_an_unusable_local_model_is_refused(bad):
+    with pytest.raises(ValueError, match="invalid local_model"):
+        local_checkpoint(bad)
+    # The refusal happens at build time, before any request is made.
+    with pytest.raises(ValueError, match="invalid local_model"):
+        build_provider(LOCAL_ONLY, env={}, local_model=bad)
+
+
+@pytest.mark.parametrize("bad", [123, 4.5, True, ["kev"], {"model": "kev"}, object()])
+def test_a_non_text_local_model_is_refused(bad):
+    with pytest.raises(ValueError, match="invalid local_model"):
+        local_checkpoint(bad)
+    with pytest.raises(ValueError, match="invalid local_model"):
+        build_provider(LOCAL_ONLY, env={}, local_model=bad)
+
+
+def test_a_value_needing_url_escaping_is_refused_deliberately():
+    # A model name is sent in a JSON body, not in a URL path, so the shape does
+    # not percent-encode anything. The choice is deliberate: a name carrying a
+    # character that would corrupt a path segment is refused rather than
+    # silently rewritten, so a local engine is never misaddressed.
+    assert local_checkpoint("org/model:v2") == "org/model:v2"
+    for needs_escaping in ("a?b", "a#b", "a&b", "a b", "a%b"):
+        with pytest.raises(ValueError, match="invalid local_model"):
+            local_checkpoint(needs_escaping)
+    # The characters that engine names actually use are accepted.
+    for accepted in (
+        "convaiinnovations/laya",
+        "laya-typed-decisions",
+        "jeff-gemma4-e2b",
+        "Tev1-0.8B",
+        "model_1.2",
+    ):
+        assert local_checkpoint(accepted) == accepted
+
+
+def test_local_model_never_becomes_a_mode_alias_or_a_fallback_member():
+    # A model name is not a route, so it is refused by the mode resolver and it
+    # cannot be appended to a hosted order as a last resort.
+    for engine in ("kev", "tev1", "laya-multilingual"):
+        assert resolve_provider(engine) == engine
+        with pytest.raises(ValueError, match="invalid provider"):
+            provider_order(engine)
+    for engine in ("kev", "tev1"):
+        with pytest.raises(ValueError, match="invalid fallback_order"):
+            validate_fallback_order(("openrouter", engine))
+        with pytest.raises(ValueError, match="invalid fallback_order"):
+            validate_fallback_order((engine,))
+    assert engine not in MODE_ALIASES
+    assert engine not in PROVIDER_MODES
+    assert engine not in CANONICAL_MODES
+
+
+def test_a_rejected_local_model_never_reaches_a_log_record(caplog):
+    # The refusal message names the setting and the shape, never the case, an
+    # entity state, or an answer.
+    with caplog.at_level(logging.WARNING, logger="sentinel.providers"):
+        with pytest.raises(ValueError) as raised:
+            build_provider(LOCAL_ONLY, env={}, local_model="a b")
+    assert "local_model" in str(raised.value)
+    assert "MARKER" not in caplog.text
 
 
 def test_the_breaker_allows_three_fallbacks_and_suppresses_the_fourth(monkeypatch):
@@ -958,3 +1349,267 @@ def test_a_suppressed_fallback_logs_the_category_not_the_case(monkeypatch, caplo
     assert "suppressed" in caplog.text
     assert marker not in caplog.text
     assert transport.attempts.count(hosted) == LOCAL_FALLBACK_FAILURE_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# the four modes: chain behaviour, fallback triggers, and redaction
+# ---------------------------------------------------------------------------
+
+
+def test_the_hosted_first_chain_calls_the_api_and_falls_through_to_local(monkeypatch):
+    """``api_with_local_fallback`` leads with the API and the local slot behind.
+
+    This is the one arrangement v1.3.0 did not have, so its behaviour is proved
+    here rather than inferred from the local-first chain.
+    """
+    package = sys.modules["sentinel.jev"]
+    hosted = "https://openrouter.ai/api/alpha/decisions"
+    provider = build_provider(
+        API_WITH_LOCAL_FALLBACK, api_key="private", env={}, local_model="kev"
+    )
+    assert isinstance(provider, ChainedJev)
+    assert provider.names == ("openrouter", LOCAL_PROVIDER)
+
+    # The API answers, so the local slot is never reached.
+    seen = _capture(monkeypatch, package, _answered())
+    decision = provider.decide({"case": {"event_type": "manual"}})
+    assert seen["url"] == hosted
+    assert decision.raw["provider"] == "openrouter"
+    assert decision.raw["attempted"] == ["openrouter"]
+
+    # A refusal on the API falls through to the local slot, and the local hop
+    # asks for the configured engine rather than the default.
+    def _api_refuses_then_local_answers(request):
+        if request.full_url == hosted:
+            raise _http_error(503)
+        assert json.loads(request.data.decode())["model"] == "kev"
+        return _Response(_answered())
+
+    transport = _RecordingTransport(_api_refuses_then_local_answers)
+    monkeypatch.setattr(package, "urlopen", transport)
+    decision = provider.decide({"case": {"event_type": "manual"}})
+    assert transport.attempts == [hosted, LOCAL_URL]
+    assert transport.headers[1] == {"Content-Type": "application/json"}
+    assert decision.raw["provider"] == LOCAL_PROVIDER
+    assert decision.raw["attempted"] == ["openrouter", LOCAL_PROVIDER]
+
+
+def test_the_single_provider_modes_never_reroute(monkeypatch):
+    """``api_only`` and ``local_only`` report a failure; they never reroute."""
+
+    def _refuses(request, timeout=None):
+        raise URLError("provider is unreachable")
+
+    package = sys.modules["sentinel.jev"]
+    for mode in (API_ONLY, LOCAL_ONLY):
+        monkeypatch.setattr(package, "urlopen", _refuses)
+        provider = build_provider(mode, api_key="private", env={})
+        with pytest.raises(URLError):
+            provider.decide({"case": {"event_type": "manual"}})
+    # Neither single-provider mode is a chain, so there is no second hop that a
+    # failure could have reached.
+    assert isinstance(
+        build_provider(API_ONLY, api_key="private", env={}), OpenRouterJev
+    )
+    assert isinstance(build_provider(LOCAL_ONLY, env={}), LayaJev)
+
+
+def test_only_the_documented_triggers_fall_through_on_both_chains(monkeypatch):
+    """A failure that is not a documented trigger never reaches the next hop.
+
+    The hosted and local adapters do not run the typed answer validator, so this
+    asserts the part that is guaranteed on both fallback modes: the trigger set
+    is the documented one, and it is the same set whichever side leads.
+    """
+    package = sys.modules["sentinel.jev"]
+    hosted = "https://openrouter.ai/api/alpha/decisions"
+    # Documented triggers: unreachable, refused, rate limited, or broken.
+    for error in (
+        URLError("down"),
+        TimeoutError("timed out"),
+        _http_error(401),
+        _http_error(429),
+        _http_error(503),
+    ):
+        assert is_fallback_trigger(error) is True, error
+    # Anything else propagates, on the hosted-first chain and the local-first one.
+    for error in (_http_error(400), _http_error(422), KeyError("answers")):
+        assert is_fallback_trigger(error) is False, error
+    for mode, first, second in (
+        (API_WITH_LOCAL_FALLBACK, hosted, LOCAL_URL),
+        (LOCAL_WITH_API_FALLBACK, LOCAL_URL, hosted),
+    ):
+
+        def _first_fails(request, timeout=None):
+            if request.full_url == first:
+                raise _http_error(422)
+            return _Response(_answered())
+
+        transport = _RecordingTransport(_first_fails)
+        monkeypatch.setattr(package, "urlopen", transport)
+        provider = build_provider(mode, api_key="private", env={}, local_model="kev")
+        with pytest.raises(HTTPError):
+            provider.decide({})
+        assert transport.attempts == [first], mode
+
+
+def test_the_four_modes_agree_between_the_package_and_the_runtime_bridge():
+    """The contract exists twice, so the two copies must resolve identically."""
+    package = sys.modules["sentinel.providers"]
+    both = {
+        "OPENROUTER_API_KEY": "private",
+        "CLOUDFLARE_API_TOKEN": "private",
+        "CLOUDFLARE_ACCOUNT_ID": "private-account",
+    }
+    for mode in CANONICAL_MODES:
+        for env in (both, {}, {"LAYA_API_KEY": "k"}):
+            assert _order_or_error(package, mode, env) == _order_or_error(
+                _runtime, mode, env
+            ), (mode, env)
+    # Both copies refuse the same names, with the same text.
+    for unknown in ("nonsense", "Laya", "kev", "local_with_api_fallback_now"):
+        assert _order_or_error(package, unknown, both) == _order_or_error(
+            _runtime, unknown, both
+        ), unknown
+        assert package.resolve_provider(unknown) == _runtime.resolve_provider(unknown)
+    for name in MODE_ALIASES:
+        assert _runtime.resolve_provider(name) == package.resolve_provider(name), name
+        assert _runtime.provider_mode(name) == package.provider_mode(name), name
+    for env in ({}, dict(both), {"LAYA_API_KEY": "k"}):
+        for model in (None, "kev", "tev1"):
+            assert _order_or_error(
+                package, API_WITH_LOCAL_FALLBACK, env, local_model=model
+            ) == _order_or_error(
+                _runtime, _runtime.API_WITH_LOCAL_FALLBACK, env, local_model=model
+            ), (
+                env,
+                model,
+            )
+            assert package.local_checkpoint(model) == _runtime.local_checkpoint(model)
+    # The refusal text for an unusable local model is identical too.
+    for bad in ("", "a b", "a?b", 123):
+        texts = []
+        for call in (package.local_checkpoint, _runtime.local_checkpoint):
+            with pytest.raises(ValueError) as raised:
+                call(bad)
+            texts.append(str(raised.value))
+        assert texts[0] == texts[1], bad
+        assert "invalid local_model" in texts[0]
+
+
+def _order_or_error(module_or_function, name, env, **kwargs):
+    """The resolved order, or the text of the error it raised."""
+    function = getattr(module_or_function, "provider_order", module_or_function)
+    try:
+        return function(name, env=env, **kwargs)
+    except ValueError as exc:
+        return f"ValueError: {exc}"
+
+
+def test_no_diagnostic_or_failure_message_carries_a_credential_or_case(caplog):
+    """Existing repository policy: no payload in a message or a log record.
+
+    A mode resolution failure names a variable and a mode. Neither a stored key,
+    nor a case marker, nor an answer, nor an entity state appears in it.
+    """
+    marker = "MARKER-bedroom-window-9911"
+    secret = "stored-openrouter-key-9911"
+    with caplog.at_level(logging.WARNING):
+        for name in (
+            LOCAL_WITH_API_FALLBACK,
+            API_WITH_LOCAL_FALLBACK,
+            API_ONLY,
+            "openrouter",
+            "clef",
+        ):
+            # No key is supplied at all, so the hosted side is genuinely absent
+            # and the refusal names the variable rather than a value.
+            with pytest.raises(ValueError) as raised:
+                build_provider(name, env={"LAYA_API_KEY": "k"})
+            message = str(raised.value)
+            assert secret not in message, name
+            assert marker not in message
+            # The variable name is named so a misconfiguration is actionable,
+            # and no value is. Each name is refused for its own side: the
+            # Clef names name the Cloudflare variables, which is correct.
+            assert "OPENROUTER_API_KEY" in message or (
+                "CLOUDFLARE_API_TOKEN" in message and "CLOUDFLARE_ACCOUNT_ID" in message
+            ), name
+    assert secret not in caplog.text
+    assert marker not in caplog.text
+
+
+def test_the_fallback_modes_are_the_only_two_that_chain():
+    """Two of the four modes are chains; two are single-provider routes."""
+    env = {"OPENROUTER_API_KEY": "private"}
+    assert len(provider_order(API_WITH_LOCAL_FALLBACK, env=env)) == 2
+    assert len(provider_order(LOCAL_WITH_API_FALLBACK, env=env)) == 2
+    assert len(provider_order(API_ONLY, env=env)) == 1
+    assert len(provider_order(LOCAL_ONLY, env=env)) == 1
+    for mode in CANONICAL_MODES:
+        assert provider_mode(mode) == mode
+
+
+# ---------------------------------------------------------------------------
+# credential resolution: an empty value is a missing value, never a borrowed one
+# ---------------------------------------------------------------------------
+
+
+def test_an_explicitly_empty_credential_is_never_borrowed_from_the_environment(
+    monkeypatch,
+):
+    """A caller that passes an empty credential means "none", not "look it up".
+
+    Falling through to the process environment on an empty value is how a real
+    key leaks out of a machine and into a request the caller was trying to keep
+    out of one. Every adapter that resolves a credential is covered, in both
+    copies.
+    """
+    secrets = {
+        "OPENROUTER_API_KEY": "real-machine-openrouter-key",
+        "CLOUDFLARE_API_TOKEN": "real-machine-cloudflare-token",
+        "CLOUDFLARE_ACCOUNT_ID": "real-machine-account",
+        "LAYA_API_KEY": "real-machine-laya-token",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    for module in (sys.modules["sentinel.jev"], _runtime):
+        assert module.OpenRouterJev("").api_key == ""
+        assert module.ClefJev("", account_id="acct").api_token == ""
+        assert module.LayaJev(api_key="").api_key == ""
+        # None still means "read the environment", which is the contract a
+        # caller with no value of its own relies on.
+        assert module.OpenRouterJev().api_key == secrets["OPENROUTER_API_KEY"]
+        assert module.ClefJev().api_token == secrets["CLOUDFLARE_API_TOKEN"]
+        assert module.LayaJev().api_key == secrets["LAYA_API_KEY"]
+
+
+def test_the_entry_builder_does_not_forward_the_stored_key_to_clef(monkeypatch):
+    """An entry holds one credential, and it belongs to the hosted Jev hops."""
+    secret = "stored-openrouter-key-9911"
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "env-clef-token")
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "env-acct")
+    clef_env = {
+        "CLOUDFLARE_API_TOKEN": "env-clef-token",
+        "CLOUDFLARE_ACCOUNT_ID": "env-acct",
+        "OPENROUTER_API_KEY": secret,
+    }
+    for name in (
+        "clef",
+        "clef_api",
+        "clef_then_jev",
+        "clef_with_jev_fallback",
+        "clef_with_local_fallback",
+    ):
+        provider = build_provider(name, api_key=secret, env=clef_env)
+        assert secret not in repr(provider), name
+    # A Clef route built with the stored key still contributes no key to the
+    # Clef adapter: it reads its own credential from the environment.
+    clef = build_provider("clef", api_key=secret, env=clef_env)
+    assert clef.api_token == "env-clef-token"
+    assert secret not in repr(clef)
+    # The key is still used where it belongs: on the hosted Jev hop behind Clef.
+    chain = build_provider("clef_with_jev_fallback", api_key=secret, env=clef_env)
+    assert isinstance(chain, ChainedJev)
+    hosted = [adapter for name, adapter in chain.providers if name == "openrouter"]
+    assert hosted and hosted[0].api_key == secret

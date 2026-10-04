@@ -63,6 +63,7 @@ from sentinel import (
     confidence_from_score,
     decision_questions,
     is_fallback_trigger,
+    pins_clef,
     provider_mode,
     provider_order,
     resolve_provider,
@@ -222,9 +223,14 @@ def test_clef_is_a_hosted_provider_with_two_checkpoints():
     assert clef_checkpoint("clef-flash") == "clef-flash"
     assert clef_checkpoint("CLEF-FLASH") == "clef-flash"
     # The checkpoint is a setting of one provider, so the provider name stays
-    # singular and the mode name stays singular.
-    assert PROVIDER_MODES["clef"] == "clef_api"
-    assert MODE_ALIASES["clef_api"] == "clef"
+    # singular and the mode name stays singular. v1.4.0 replaced the arrangement
+    # name with the canonical mode name, so `clef` now reports `api_only`: one
+    # hosted provider whose failure is reported and never rerouted, which is
+    # exactly what `clef_api` selected before.
+    assert PROVIDER_MODES["clef"] == "api_only"
+    assert MODE_ALIASES["clef_api"] == "api_only"
+    assert MODE_ALIASES["clef"] == "api_only"
+    assert "clef_api" not in MODE_NAMES
     assert "clef-flash" not in MODE_NAMES
     # A checkpoint is not a provider name: it is never a route, and it never
     # reaches the network, because provider_order refuses it.
@@ -273,8 +279,14 @@ def test_clef_is_selected_on_its_own_and_sits_in_a_fallback_order():
 
 
 def test_clef_with_jev_fallback_chains_clef_first():
-    assert MODE_ALIASES["clef_with_jev_fallback"] == CLEF_CHAINED_PROVIDER
-    assert provider_mode("clef_then_jev") == "clef_with_jev_fallback"
+    # `clef_then_jev` is a hosted-only chain: Clef first, then hosted Jev. Both
+    # of its hops are hosted, so it is not one of the four canonical modes, and
+    # it resolves to `local_with_api_fallback` with the Clef lead preserved by
+    # the stored spelling rather than by the mode name alone.
+    assert MODE_ALIASES["clef_with_jev_fallback"] == "local_with_api_fallback"
+    assert MODE_ALIASES[CLEF_CHAINED_PROVIDER] == "local_with_api_fallback"
+    assert provider_mode("clef_then_jev") == "local_with_api_fallback"
+    assert provider_mode("clef_with_jev_fallback") == "local_with_api_fallback"
     order = provider_order(
         "clef_with_jev_fallback",
         env={**CONFIG, "OPENROUTER_API_KEY": "private"},
@@ -860,15 +872,19 @@ def test_an_existing_entry_keeps_working_unchanged():
     }
 
     def _build(data):
-        # The same rules _provider_for applies, read from the entry data.
-        provider = resolve_provider(data.get("provider", "openrouter"))
-        stored_key = (
-            None if provider in ("clef", "clef_then_jev") else data.get("api_key")
-        )
+        # The same rules _provider_for applies, read from the entry data. The
+        # stored name is inspected before it is resolved, because resolution
+        # collapses a Clef-pinned name and a Jev-pinned name onto one canonical
+        # mode and the difference decides which credential the entry may
+        # contribute. That is the exact shape of the entry module's own rule.
+        stored = str(data.get("provider", "openrouter"))
+        provider = resolve_provider(stored)
+        stored_key = None if pins_clef(stored) else data.get("api_key")
         return build_provider(
-            provider,
+            stored,
             api_key=stored_key,
             clef_model=data.get("clef_model") or CLEF_DEFAULT_MODEL,
+            local_model=data.get("local_model"),
             env={**_clef_env_for_entry, "OPENROUTER_API_KEY": stored_key or "stored"},
         )
 

@@ -2,6 +2,20 @@
 
 This reference describes the public contracts implemented in `custom_components/jev_sentinel` and `sentinel`.
 
+## What answers the decision step
+
+A **System One decision model**, also written *typed decision model*, is a model that returns typed values, each carrying a probability, rather than prose. [TypeSafe coined the category alongside Jev on 15 September 2026](https://systemonemodels.org/guides/what-is-a-system-one-model/), and it is written System 1 as well. **Jev is one member of the category, not the name of it.**
+
+Other members catalogued in the same index: **CLM** and **GLiNER2.5-Decide** (open weights), plus hosted **d1** (Liquid AI), **Mercury Decide** (Inception, free on OpenRouter), **Solar Decide** (Upstage), **pplx-decider** (Perplexity), **Span-01** (Respan), **Decider 1** (meraGPT), and the **OpenAI Decisions API**.
+
+| Model | Where it runs | Weights | Adapter here |
+|---|---|---|---|
+| **Jev** | hosted, TypeSafe or OpenRouter | closed | `OpenRouterJev` |
+| **Clef** and **Clef Flash** | hosted, Cloudflare Workers AI | closed | `ClefJev`, checkpoint chosen by `clef_model` |
+| **Laya** | local, on this machine | open | `LayaJev`, the default for `local_model` |
+| **Kev** | wherever you host it | open, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases | the local slot, as `local_model: kev` |
+| **Tev1** | wherever you host it | open, Together AI, Qwen3.5-based | the local slot, as `local_model: tev1` |
+
 ## Runtime boundaries
 
 The Home Assistant component creates a case, calls the configured provider, and fires events. It does not dispatch a Home Assistant device service. The standalone core adds policy authorization and execution callbacks for an external consumer.
@@ -54,25 +68,77 @@ The runtime asks for `outcome`, `action`, and `confidence`. Outcomes are constra
 
 `shadow` is true in the runtime and core defaults. `SentinelWorkflow.execute` refuses to dispatch a shadow decision and returns `authorization.status: shadow_only`. Only a caller-created non-shadow decision can enter the provider-neutral execution path.
 
-## Provider routes
+## The four decision modes
 
-There are five routes. The local route is an alternative to the hosted routes rather than a member of one chain with them, and the last two are explicit opt-in chains:
+Configuration exposes exactly four modes. Each names which side leads and whether the other side is a fallback:
 
-1. Hosted Jev, over an OpenRouter API key.
-2. Cloudflare Clef, over a Workers AI account and API token from the environment, with `clef` and `clef-flash` as two checkpoints of the one provider.
-3. Laya, running on this machine, with no API key at all.
-4. `laya_then_hosted`: Laya first, then the hosted providers that are configured, as an explicit opt-in.
-5. `clef_then_jev`: Clef first, then hosted Jev, as an explicit opt-in.
+| Mode | Leads | Fallback | Provider order |
+|---|---|---|---|
+| `api_with_local_fallback` | hosted API | local | every configured hosted provider, in the hosted order, then `laya` |
+| `api_only` | hosted API | none | one configured hosted provider |
+| `local_only` | local | none | `["laya"]` |
+| `local_with_api_fallback` | local | hosted API | `["laya", ...]` every configured hosted provider, in the hosted order |
 
-Each route also has a name in the vocabulary the DOGA fork uses. The config flow offers the arrangement name next to its canonical route alias, and `resolve_provider` and `provider_mode` map between the two spellings:
+`api_only` and `local_only` are single-provider routes: no chain, no fallback, and no cooldown list beyond the one provider. A failure there is reported, never rerouted. `api_with_local_fallback` and `local_with_api_fallback` are two-provider chains and use the existing cooldown, trigger, and breaker machinery unchanged.
 
-| Named arrangement | Canonical route | What runs |
+A mode that promises a fallback but has no usable provider for the other side fails at load, naming the missing environment variable, rather than silently degrading into a single-provider mode under another name.
+
+### The alias table
+
+Every name this repository shipped before v1.4.0 keeps working, so no deployed configuration breaks. Each alias resolves onto one canonical mode before it reaches a chain, a diagnostic, a log line, or a URL, so no alias string appears in observable output.
+
+| Alias | Resolves to | Provider order it produces |
 |---|---|---|
-| `jev_api` | `openrouter` | Hosted Jev over the API key. |
-| `clef_api` | `clef` | Cloudflare Clef over the environment. |
-| `laya_local` | `laya` | The local server alone, no key, no fallback. |
-| `laya_with_jev_fallback` | `laya_then_hosted` | The local server first, the hosted key behind it. |
-| `clef_with_jev_fallback` | `clef_then_jev` | Clef first, hosted Jev behind it. |
+| `api_with_local_fallback` | itself | `["openrouter", "laya"]` |
+| `clef_with_local_fallback` | `api_with_local_fallback`, Clef-pinned | `["clef", "laya"]` |
+| `api_only` | itself | `["openrouter"]` |
+| `openrouter`, `jev_api` | `api_only`, OpenRouter-pinned | `["openrouter"]` |
+| `clef`, `clef_api` | `api_only`, Clef-pinned | `["clef"]` |
+| `auto` | `api_only`, or `api_with_local_fallback` when a `local_model` is set | the configured hosted providers, plus `laya` when a local model is set |
+| `local_only` | itself | `["laya"]` |
+| `laya`, `laya_local` | `local_only` | `["laya"]` |
+| `local_with_api_fallback` | itself | `["laya", "openrouter"]` |
+| `laya_then_hosted`, `laya_with_jev_fallback` | `local_with_api_fallback` | `["laya", "openrouter"]` |
+| `clef_then_jev`, `clef_with_jev_fallback` | `local_with_api_fallback`, Clef-pinned | `["clef", "openrouter"]` |
+
+Three of these need explaining, because the four-mode vocabulary does not map cleanly onto everything this repository shipped:
+
+- **`auto` is dynamic.** It resolves to `api_with_local_fallback` when a `local_model` has been explicitly configured and to `api_only` otherwise, which is what it meant before v1.4.0: the hosted providers that are configured. It never selects the local slot on its own initiative, so `provider_order("auto", env={}, local_model="kev")` is still `[]`.
+- **The hosted provider names resolve to `api_only`.** `openrouter`, `jev_api`, `clef`, and `clef_api` each named one hosted provider whose failure was reported and never rerouted, so each keeps meaning exactly that. A hosted provider reaches `api_with_local_fallback` only by naming the mode or the Clef-pinned alias.
+- **`clef_then_jev` is not one of the four modes.** Both of its hops are hosted, so it is a hosted-to-hosted chain rather than one side falling back to the other. It resolves to `local_with_api_fallback` so an entry storing it keeps routing the same way, and `pins_clef(stored_name)` preserves the Clef lead, because the canonical mode name alone cannot express which hosted provider leads. The Home Assistant entry module therefore reads the stored spelling before resolving it, and passes the stored name rather than the resolved mode to `build_provider`.
+
+Case handling is unchanged from v1.3.0. The arrangement names and the four canonical mode names are recognised in either case; the canonical route names are matched exactly as they were, so `provider_order("Laya")` still raises rather than newly becoming the local mode.
+
+`MODE_NAMES` is the four canonical mode names, `MODE_ALIASES` maps every accepted name onto one of them, and `PROVIDER_MODES` maps back. `resolve_provider(name)` rewrites an accepted name and returns anything else unchanged, so an unknown value keeps its existing validation. `provider_mode(name)` returns the canonical mode and raises `ValueError("invalid provider: ...")` for anything else, and the message names every accepted mode and alias rather than hiding them.
+
+### The hosted providers are not renamed
+
+Which hosted model answers the API side is its own choice and is unchanged:
+
+1. Hosted Jev, over an OpenRouter API key. Jev is one System One decision model, served by TypeSafe and reachable here through OpenRouter.
+2. Cloudflare Clef, over a Workers AI account and API token from the environment, with `clef` and `clef-flash` as two checkpoints of the one provider. Clef is a separate member of the same category, not a Jev endpoint.
+
+Both remain individually selectable and remain the members of `HOSTED_PROVIDERS` and of the hosted fallback order.
+
+### The local slot is a generic local decision-model slot
+
+The provider name in configuration stays `laya`. What changed in v1.4.0 is that it is no longer a hard-coded binding to one model: the new `local_model` setting selects which local decision model answers, it defaults to `laya`, and its value is the checkpoint or engine name sent to the local server.
+
+`local_checkpoint(model)` resolves the value:
+
+- `None` returns `laya`, so an entry that stored nothing keeps calling Laya and the default path is unchanged.
+- Any other name is accepted. There is deliberately **no allowlist of model names**, because the point is interchangeability: a local model published after this release must work by configuration alone, with no code change and no new provider name.
+- A value that cannot be a name at all is refused with `ValueError("invalid local_model: ...")`: an empty or whitespace-only value, a value that is not text, and a value carrying a control character, a quote, a backslash, whitespace, or the URL delimiters `?`, `#`, and `&`, any of which would corrupt the JSON body or a URL path segment.
+
+Known to fit the slot, because they publish the same `/v1/systemone` request shape: `laya` (also `laya-multilingual` and `laya-typed-decisions`), `kev` (open weights, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases, also published as `kev-0.8b`), `tev1` ([Together AI](https://github.com/togethercomputer/tev1), Qwen3.5-based, open weights; `Tev1-4B` and `Tev1-0.8B`), and `jeff-qwen3.5-0.8b` and `jeff-gemma4-e2b`. The reference for the interchangeable-engine claim is [chaitin/Decis](https://github.com/chaitin/Decis), which serves Laya, Kev, and the jeff family behind one `/v1/systemone` endpoint with one Docker image per engine, where swapping `base_url` is the whole migration.
+
+The local server URL remains its own setting, `laya_base_url`, so pointing the slot at a different engine is a configuration change. See [the integration guide](integrations.md#pointing-the-local-slot-at-a-different-engine).
+
+`local_model` never appears in a fallback order and is never a mode alias: `validate_fallback_order(("kev",))` raises `ValueError("invalid fallback_order")` and `provider_order("kev")` raises `ValueError("invalid provider: ...")`.
+
+### `laya_model` and `local_model`
+
+The pre-existing `laya_model` setting is kept for backwards compatibility and is the deprecated spelling of `local_model`. **`local_model` takes precedence when it is set**; an entry that stored only `laya_model` keeps calling that checkpoint. `build_provider(local_model=..., laya_model=...)` resolves the same way, and so does the Home Assistant entry module.
 
 `MODE_NAMES` is the five arrangement names, `MODE_ALIASES` maps each onto its canonical route, and `PROVIDER_MODES` maps back. `resolve_provider(name)` rewrites an arrangement name, in either case, and returns anything else unchanged, so the canonical names keep their existing validation. `provider_mode(provider)` returns the arrangement name for a route and raises `ValueError("invalid provider")` for anything else, including `auto`.
 
@@ -83,11 +149,13 @@ Each route also has a name in the vocabulary the DOGA fork uses. The config flow
 | `"laya"` | `["laya"]` | Exactly one provider. The local route replaces the hosted routes. |
 | `"openrouter"` | `["openrouter"]` | Raises `ValueError("missing OPENROUTER_API_KEY")` without a key. |
 | `"clef"` | `["clef"]` | Raises `ValueError("missing CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID")` unless both Clef variables are set. A provider is configured only when every variable it needs is present. |
-| `"laya_then_hosted"` | `["laya", "openrouter"]` with a configured hosted provider, and no result without one | Raises `ValueError("missing OPENROUTER_API_KEY for the laya_then_hosted route")` when no hosted provider is configured. |
-| `"clef_then_jev"` | `["clef", "openrouter"]` | Raises when Clef is not configured, and raises `ValueError("no configured hosted provider behind Clef for the clef_then_jev route")` when nothing is configured behind it. |
+| `"api_with_local_fallback"` | `["openrouter", "laya"]` with a configured hosted provider, and no result without one | Raises `ValueError("missing OPENROUTER_API_KEY for the api_with_local_fallback mode")` when no hosted provider is configured. |
+| `"local_with_api_fallback"` | `["laya", "openrouter"]` with a configured hosted provider, and no result without one | Raises `ValueError("missing OPENROUTER_API_KEY for the local_with_api_fallback mode")` when no hosted provider is configured. |
+| `"clef_with_local_fallback"` | `["clef", "laya"]` | Raises `ValueError("missing CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID")` when Clef is not configured. |
+| `"clef_with_jev_fallback"` | `["clef", "openrouter"]` | Raises when Clef is not configured, and raises `ValueError("no configured hosted provider behind Clef for the clef_then_jev route")` when nothing is configured behind it. |
 | `"auto"` (default) | the configured members of `fallback_order`, `[]` without | Never selects the local route on its own initiative. `DEFAULT_FALLBACK_ORDER` is `("openrouter",)`. |
 
-`validate_fallback_order(order)` accepts a non-empty, duplicate-free order drawn from the hosted names only, which are `("openrouter", "clef")`. `("openrouter", "laya")` and `("laya",)` both raise `ValueError("invalid fallback_order")`, so the local route cannot be added to the hosted order as a last resort. A route name is rejected there too: `("laya_then_hosted",)` raises the same error, because a chain is not a member of a chain. `provider_order` raises `ValueError("invalid provider")` for any name outside `auto`, `openrouter`, `clef`, `laya`, `laya_then_hosted`, and `clef_then_jev`, which here includes `typesafe` and `clef-flash`.
+`validate_fallback_order(order)` accepts a non-empty, duplicate-free order drawn from the hosted names only, which are `("openrouter", "clef")`. `("openrouter", "laya")` and `("laya",)` both raise `ValueError("invalid fallback_order")`, so the local slot cannot be added to the hosted order as a last resort. A mode name is rejected there too: `("local_with_api_fallback",)` raises the same error, because a chain is not a member of a chain, and so does a `local_model` value such as `("kev",)`, so a model name can never become a hosted member. `provider_order` raises `ValueError("invalid provider: ...")` for any name outside the [alias table](#the-alias-table), which here includes `typesafe`, `clef-flash`, `Laya`, and `kev`.
 
 `build_provider(...)` returns `LayaJev` for the local route, `OpenRouterJev` for the hosted Jev route, `ClefJev` for the Clef route, and `ChainedJev` for either chained route. It raises `RuntimeError("no Jev provider is configured...")` when `auto` resolves to no provider. An explicit `api_key` also satisfies the OpenRouter route check, so a caller holding its key in its own configuration does not need it in the environment. On a chained route that key belongs to the OpenRouter hops; the local hop keeps its own optional `LAYA_API_KEY`, and the Clef hop never receives it. On the local route, `api_key` is the optional bearer for a `laya-serve` started with its own check.
 
@@ -172,7 +240,7 @@ The mapping is total and injective. An id already in the alphabet passes through
 
 ### Local Laya provider
 
-`LayaJev` points the same payload at a `laya-serve` process on loopback. Laya publishes `POST /v1/systemone` in the same Decisions contract, so the request and response path match the hosted route except for the host, the absence of a credential, and the `model` field, which names a Laya checkpoint instead of a Jev model.
+`LayaJev` points the same payload at a `laya-serve` process on loopback. Laya publishes `POST /v1/systemone`, the request shape shared across System One decision models, so the request and response path match the hosted route except for the host, the absence of a credential, and the `model` field, which names the checkpoint rather than a fixed vendor model.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -186,7 +254,7 @@ The mapping is total and injective. An id already in the alphabet passes through
 
 ### Laya then hosted route
 
-`ChainedJev` holds an ordered list of named adapters and returns the answer from the first one that answers. On the `laya_then_hosted` route the order is `laya` first and then every configured hosted provider; on the `clef_then_jev` route it is `clef` first and then the configured OpenRouter hop. So a review costs no provider request while the first hop answers:
+`ChainedJev` holds an ordered list of named adapters and returns the answer from the first one that answers. On `local_with_api_fallback` the order is `laya` first and then every configured hosted provider; on `api_with_local_fallback` it is the configured hosted providers first and `laya` behind them; on `clef_with_jev_fallback` it is `clef` first and then the configured OpenRouter hop. So a review costs no provider request while the first hop answers:
 
 ```json
 {
@@ -233,13 +301,13 @@ A repeated local outage must not turn every household case into remote traffic, 
 
 The counter is process state, not case state. It is per process and resets on restart, and `local_failure_count()` reports it while `reset_local_failures()` clears it. Both copies of the provider rules carry the same four names, and the drift test asserts the same limit and the same trip behaviour in each.
 
-The breaker guards the local hop only. It is not applied to a hosted hop leading to another hosted provider, so `clef_then_jev` falls through on every qualifying failure rather than after three. A hosted provider that is persistently down therefore costs one failed request per hop per review, which is the cost the plain hosted route already carries.
+The breaker guards the local hop only. It is not applied to a hosted hop leading to another hosted provider, so `clef_with_jev_fallback` falls through on every qualifying failure rather than after three. A hosted provider that is persistently down therefore costs one failed request per hop per review, which is the cost the plain hosted route already carries.
 
 A local failure that is not a fallback trigger, such as an HTTP 422 for an invalid request, never reaches the breaker: it propagates immediately, because a request the local server rejected as invalid is not retried somewhere else and therefore creates no remote egress to bound.
 
 The breaker bounds repeated remote egress. It cannot detect a valid yet incorrect local judgment: a wrong but well-formed local answer is a success, so it is returned and it resets the counter.
 
-The route fails fast when no hosted provider is configured. `provider_order` raises `ValueError("missing OPENROUTER_API_KEY for the laya_then_hosted route")`, and `build_provider` passes that error through rather than returning a chain with a single local hop. The Clef-first chain fails fast on the same reasoning: it raises when Clef is not configured, and raises `ValueError("no configured hosted provider behind Clef for the clef_then_jev route")` when nothing is configured behind it, rather than degrading into a Clef-only route under another name. A chain built directly with fewer than two adapters raises `ValueError("a chain needs at least two providers")`.
+Each fallback mode fails fast when it has no usable provider for the side it promises. `provider_order("local_with_api_fallback")` raises `ValueError("missing OPENROUTER_API_KEY for the local_with_api_fallback mode")` and `provider_order("api_with_local_fallback")` raises the same for its own mode, and `build_provider` passes the error through rather than returning a chain with a single hop. The Clef-pinned chain fails fast on the same reasoning: it raises when Clef is not configured, and raises `ValueError("no configured hosted provider behind Clef for the clef_then_jev route")` when nothing is configured behind it, rather than degrading into a Clef-only route under another name. A chain built directly with fewer than two adapters raises `ValueError("a chain needs at least two providers")`.
 
 **Privacy.** On this route, a failed local attempt sends the redacted case to a hosted API. The redaction runs before the first attempt, in `SentinelWorkflow.review`, so the local hop and the hosted hop receive the same redacted case and credential-shaped fields never leave the machine. The rest of the case does leave the machine whenever the local server fails. A case that must never leave the machine belongs on the `laya` route, which has no fallback.
 
@@ -385,17 +453,18 @@ The config flow stores `provider`, and the fields for the selected route:
 
 | Field | Required | Default | Meaning |
 |---|---:|---|---|
-| `provider` | yes | `openrouter` | The route. `openrouter` or `jev_api` for hosted Jev over an API key, `clef` or `clef_api` for Cloudflare Clef, `laya` or `laya_local` for a local server with no key, `laya_then_hosted` or `laya_with_jev_fallback` for the local server first, `clef_then_jev` or `clef_with_jev_fallback` for Clef first. Both spellings of a route behave identically, and the stored value is not rewritten. |
+| `provider` | yes | `openrouter` | The decision mode. `api_only` for the hosted API alone, `local_only` for the local model alone, `api_with_local_fallback` for the hosted API first, `local_with_api_fallback` for the local model first. Every earlier name also selects the same routing: `openrouter`, `jev_api`, `clef`, and `clef_api` are `api_only`; `laya` and `laya_local` are `local_only`; `laya_then_hosted`, `laya_with_jev_fallback`, `clef_then_jev`, and `clef_with_jev_fallback` are `local_with_api_fallback`; `clef_with_local_fallback` is `api_with_local_fallback` with Clef leading; `auto` is the configured hosted providers, adding the local slot only when `local_model` is set. See [the alias table](#the-alias-table). The stored value is not rewritten. |
 | `clef_model` | no | `clef` | The Clef checkpoint: `clef` or `clef-flash`. Applies to the `clef` and `clef_then_jev` routes and is ignored on the others. An unknown value raises `ValueError("invalid Clef checkpoint: ...")`; a stored blank value falls back to the default. |
-| `api_key` | for `openrouter`, `laya_then_hosted`, and `clef_then_jev` | empty | The OpenRouter key. Selecting a route that reaches hosted Jev with an empty key returns the `api_key_required` error. The check runs against the resolved route, so `jev_api`, `laya_with_jev_fallback`, and `clef_with_jev_fallback` require a key, while `laya_local` and `clef_api` do not: Clef reads its own credential from the environment and never receives the stored OpenRouter key. |
-| `laya_base_url` | no | `http://127.0.0.1:8000` | Local server URL, used on the `laya` route and on the local hop of `laya_then_hosted`. |
-| `laya_model` | no | `convaiinnovations/laya` | Laya checkpoint, used on the `laya` route and on the local hop of `laya_then_hosted`. |
+| `api_key` | for `api_only`, `api_with_local_fallback`, and `local_with_api_fallback` | empty | The OpenRouter key. Selecting a mode that reaches hosted Jev with an empty key returns the `api_key_required` error. The check runs against the stored name, so `openrouter`, `jev_api`, `laya_then_hosted`, `laya_with_jev_fallback`, and `clef_with_jev_fallback` require a key, while `local_only`, `laya`, `laya_local`, and `clef_api` do not: Clef reads its own credential from the environment and never receives the stored OpenRouter key. |
+| `laya_base_url` | no | `http://127.0.0.1:8000` | The local decision-model server URL, used on `local_only` and on the local hop of both fallback modes. Pointing it at another engine's server is a configuration change, not a code change. |
+| `local_model` | no | `laya` | Which local System One decision model answers. Free text, not a list: any local model publishing the same `/v1/systemone` request shape fits, and a model published after this release works by naming it. Rejected only when empty, whitespace-only, not text, or carrying a character that would corrupt a URL path segment or a JSON string, with `ValueError("invalid local_model: ...")` at build time and the `local_model_invalid` error in the form. Known to fit: `laya`, `laya-multilingual`, `laya-typed-decisions`, `kev`, `kev-0.8b`, `tev1`, `Tev1-4B`, `Tev1-0.8B`, `jeff-qwen3.5-0.8b`, `jeff-gemma4-e2b`. **Takes precedence over `laya_model` when it is set.** |
+| `laya_model` | no | `convaiinnovations/laya` | **Deprecated.** The per-model setting kept for backwards compatibility. It is the older spelling of `local_model` and still works on its own, so an entry that stored only `laya_model` keeps calling that checkpoint. When both are present, `local_model` wins. |
 
-An existing config entry created before v1.1.0 has no `provider` field and keeps the hosted route, so no migration is required. An entry created before v1.3.0 has no `clef_model` field, which means the default checkpoint, so it needs none either. The options flow accepts optional boolean `shadow`, default `true`. The Home Assistant adapter remains shadow-only regardless of that option.
+An existing config entry created before v1.1.0 has no `provider` field and keeps the hosted route, so no migration is required. An entry created before v1.3.0 has no `clef_model` field, which means the default checkpoint, so it needs none either. An entry created before v1.4.0 has no `local_model` field, which means `laya`, so it needs none either, and any `provider` value it stored still resolves to the same routing. The options flow accepts optional boolean `shadow`, default `true`. The Home Assistant adapter remains shadow-only regardless of that option.
 
 ## Provider-neutral core
 
-The public package exports `Case`, `Decision`, `Policy`, `SentinelWorkflow`, `Verification`, `OpenRouterJev`, `ClefJev`, `LayaJev`, `ChainedJev`, `build_provider`, `provider_order`, `validate_fallback_order`, `is_fallback_trigger`, `confidence_from_score`, `decision_questions`, `laya_endpoint`, `resolve_provider`, `provider_mode`, `local_failure_count`, `reset_local_failures`, `note_local_failure`, `clef_answers`, `clef_checkpoint`, `clef_credentials`, `clef_endpoint`, `clef_question_ids`, `score_index`, `validate_answers`, `validate_score_answer`, and the constants `CHAINED_PROVIDER`, `CLEF_CHAINED_PROVIDER`, `CLEF_CHECKPOINT_PROVIDER`, `CLEF_API_BASE`, `CLEF_RUN_PATH`, `CLEF_DEFAULT_MODEL`, `CLEF_MODELS`, `CLEF_ID_MAX_LENGTH`, `CLEF_MAX_QUESTIONS`, `CLEF_TIMEOUT`, `CLEF_TOKEN_ENV`, `CLEF_ACCOUNT_ENV`, `DEFAULT_FALLBACK_ORDER`, `HOSTED_PROVIDERS`, `LOCAL_PROVIDER`, `LOCAL_PROVIDERS`, `LOCAL_FALLBACK_FAILURE_LIMIT`, `MODE_ALIASES`, `MODE_NAMES`, `PROVIDER_MODES`, `PROVIDER_NAMES`, `PROVIDER_ENV`, `PROVIDER_REQUIRED_ENV`, and `FALLBACK_STATUS_CODES`. A provider implements:
+The public package exports `Case`, `Decision`, `Policy`, `SentinelWorkflow`, `Verification`, `OpenRouterJev`, `ClefJev`, `LayaJev`, `ChainedJev`, `build_provider`, `provider_order`, `validate_fallback_order`, `is_fallback_trigger`, `confidence_from_score`, `decision_questions`, `laya_endpoint`, `resolve_provider`, `provider_mode`, `resolve_auto_mode`, `local_model_configured`, `local_checkpoint`, `accepted_provider_names`, `pins_clef`, `local_failure_count`, `reset_local_failures`, `note_local_failure`, `clef_answers`, `clef_checkpoint`, `clef_credentials`, `clef_endpoint`, `clef_question_ids`, `score_index`, `validate_answers`, `validate_score_answer`, and the constants `API_WITH_LOCAL_FALLBACK`, `API_ONLY`, `LOCAL_ONLY`, `LOCAL_WITH_API_FALLBACK`, `CANONICAL_MODES`, `FALLBACK_MODES`, `SINGLE_PROVIDER_MODES`, `CLEF_PINNED_NAMES`, `CASE_INSENSITIVE_ALIASES`, `CHAINED_PROVIDER`, `CLEF_CHAINED_PROVIDER`, `CLEF_CHECKPOINT_PROVIDER`, `CLEF_API_BASE`, `CLEF_RUN_PATH`, `CLEF_DEFAULT_MODEL`, `CLEF_MODELS`, `CLEF_ID_MAX_LENGTH`, `CLEF_MAX_QUESTIONS`, `CLEF_TIMEOUT`, `CLEF_TOKEN_ENV`, `CLEF_ACCOUNT_ENV`, `DEFAULT_FALLBACK_ORDER`, `HOSTED_PROVIDERS`, `LOCAL_PROVIDER`, `LOCAL_PROVIDERS`, `LOCAL_MODEL`, `LOCAL_MODEL_FIELD`, `LOCAL_FALLBACK_FAILURE_LIMIT`, `MODE_ALIASES`, `MODE_NAMES`, `PROVIDER_MODES`, `PROVIDER_NAMES`, `PROVIDER_ENV`, `PROVIDER_REQUIRED_ENV`, and `FALLBACK_STATUS_CODES`. A provider implements:
 
 ```python
 class DecisionProvider(Protocol):
@@ -404,13 +473,18 @@ class DecisionProvider(Protocol):
 
 `review` passes a redacted case and sorted allowed actions to the provider. `execute` rejects shadow decisions, authorizes non-shadow actions, calls `dispatch(action)` when allowed, catches dispatch failures, calls `readback()`, and records verification. It never hides an authorization or readback failure behind a successful dispatch record.
 
-`custom_components/jev_sentinel/runtime.py` is a self-contained copy of the adapter, rubric, route selection, redaction, policy, workflow, and verification contracts, because Home Assistant installs `custom_components` without installing the package. `tests/test_laya_provider.py` and `tests/test_clef_provider.py` assert that both copies produce the same rubric, the same route orders, the same confidence mapping, and the same Clef endpoint, id mapping, and failure messages, so the two cannot drift silently.
+`custom_components/jev_sentinel/runtime.py` is a self-contained copy of the adapter, rubric, mode selection, redaction, policy, workflow, and verification contracts, because Home Assistant installs `custom_components` without installing the package. `tests/test_laya_provider.py` and `tests/test_clef_provider.py` assert that both copies produce the same rubric, the same mode resolutions and provider orders, the same confidence mapping, the same local-model acceptance and refusal, and the same Clef endpoint, id mapping, and failure messages, so the two cannot drift silently.
+
+### Credential resolution
+
+A credential that is supplied explicitly wins over the process environment, **including a value that is present but empty**: an empty credential is a missing credential, so it is never topped up from `os.environ`. `None` means "read the environment", which is what a caller with no value of its own passes. This holds for `ClefJev`, `LayaJev`, and `OpenRouterJev`, and it is what stops a test that passes an empty credential from silently borrowing the machine's real key and sending it somewhere.
 
 ## Limitations
 
-- v1.3.0 has no active Home Assistant dispatch consumer.
+- v1.4.0 has no active Home Assistant dispatch consumer.
 - The integration does not poll entities or implement delayed readback.
-- Five provider routes ship: hosted Jev over an OpenRouter key, Cloudflare Clef over the environment, local Laya with no key, and the opt-in chains `laya_then_hosted` and `clef_then_jev`, each also addressable by its arrangement name `jev_api`, `clef_api`, `laya_local`, `laya_with_jev_fallback`, or `clef_with_jev_fallback`. The Jev hop is OpenRouter, which serves the TypeSafe `typesafe/jev-1.13` Jev model. A separate direct TypeSafe endpoint is not implemented, and no name outside these providers is accepted.
+- Four decision modes ship: `api_only`, `local_only`, `api_with_local_fallback`, and `local_with_api_fallback`, each also addressable by the aliases in [the alias table](#the-alias-table). Two hosted providers back the API side: hosted Jev over an OpenRouter key and Cloudflare Clef over the environment. The Jev hop is OpenRouter, which serves the TypeSafe `typesafe/jev-1.13` Jev model. A separate direct TypeSafe endpoint is not implemented, and no name outside the alias table is accepted.
+- **No local model other than the default has been called live.** The only verified live behaviour is the Laya route recorded in `docs/release-notes.md` under v1.1.0, v1.2.0, and v1.2.1, captured against a real `laya-serve` on 2026-09-26. `local_model` is proved with an injected transport and a payload capture, which shows what the request asks for but says nothing about whether another engine answers that shape. Run one review against the engine you configure and read it as a smoke test.
 - **The Clef route has no live evidence.** No Cloudflare credential authorized for Workers AI was available on the verification machine: every candidate token was refused with HTTP 401, so no real Clef request was ever made. The route is covered by unit tests with an injected transport only. Its request shape, both response envelopes, the error codes, and the id mapping come from Cloudflare's published model documentation rather than from an observed reply. Run one review before relying on it, and treat a first review as a smoke test rather than as proof of parity with hosted Jev.
 - The default `fallback_order` is still `("openrouter",)`, so the `auto` route does not select Clef until a caller names it there. Clef ships available by configuration, never selected by default order.
 - The local failure breaker bounds repeated remote egress on the chained route only, and it cannot detect a valid yet incorrect local judgment. Its counter is per process, per copy, and resets on restart. Local classification quality is measured by the DOGA benchmark cited under [Confidence scale](#confidence-scale): Laya local agreed with 56 of 100 authored goal labels against 88 for Jev.

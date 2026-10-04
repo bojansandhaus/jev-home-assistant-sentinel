@@ -3,25 +3,27 @@
     "step": {
       "user": {
         "title": "Connect Jev Home Assistant Sentinel",
-        "description": "Choose one route. Hosted Jev runs over the OpenRouter API key. Laya runs on this machine with no API key. Laya first with the hosted key as fallback asks the local server first, then sends the same redacted case to the hosted endpoint if the local server fails. Cloudflare Clef runs over a Workers AI account and API token read from the CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN environment variables, which is why this form does not ask for them: a config entry is stored on disk in plain text. Clef first with hosted Jev as fallback calls Clef, then sends the same redacted case to the hosted Jev endpoint if Clef is unreachable, refused, rate limited, or broken.",
+        "description": "Choose one of four modes. Both sides answer with a System One decision model, also written a typed decision model: one that returns typed values with a probability for each rather than prose. See https://systemonemodels.org/guides/what-is-a-system-one-model/ . api_with_local_fallback calls the hosted API first and the local model if it fails. api_only calls the hosted API alone. local_only calls the local model alone. local_with_api_fallback calls the local model first and the hosted API if it fails. Names from earlier versions still work and mean the same thing: jev_api and clef_api are api_only, laya_local is local_only, and laya_with_jev_fallback and clef_with_jev_fallback are local_with_api_fallback. local_model selects which local System One decision model answers, so laya, kev, tev1 or a jeff engine all fit without a code change. The hosted API side is Jev over the OpenRouter API key, or Cloudflare Clef, which reads its Workers AI account and API token from the CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN environment variables; this form does not ask for them because a config entry is stored on disk in plain text.",
         "data": {
-          "provider": "Provider",
+          "provider": "Decision mode",
           "api_key": "OpenRouter API key",
-          "laya_base_url": "Laya base URL",
-          "laya_model": "Laya checkpoint",
+          "laya_base_url": "Local decision-model server URL",
+          "local_model": "Local System One decision model",
+          "laya_model": "Local checkpoint (deprecated, superseded by Local System One decision model)",
           "clef_model": "Clef checkpoint"
         }
       }
     },
     "error": {
-      "api_key_required": "The routes that reach hosted Jev need an OpenRouter API key. Select Laya alone only when a local laya-serve is running, or Clef when CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set in the environment."
+      "api_key_required": "The modes that reach the hosted API need an OpenRouter API key. Select local_only only when a local decision-model server is running, or Clef when CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set in the environment.",
+      "local_model_invalid": "The local System One decision model name cannot be empty and cannot contain whitespace, a quote, a backslash, or the URL characters ?, #, and &. Use an engine name such as laya, kev, tev1, or jeff-qwen3.5-0.8b."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Sentinel options",
-        "description": "Sentinel remains advisory in v1.3.0. This option is retained for forward compatibility.",
+        "description": "Sentinel remains advisory in v1.4.0. This option is retained for forward compatibility.",
         "data": {
           "shadow": "Shadow mode"
         }
