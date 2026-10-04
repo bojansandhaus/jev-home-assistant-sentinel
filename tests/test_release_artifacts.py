@@ -81,6 +81,17 @@ def test_translations_offer_every_mode_the_code_accepts():
         "clef_with_jev_fallback",
     ):
         assert alias in description, alias
+    # Home Assistant's hassfest rejects a URL in any user-facing string and asks
+    # for a description placeholder instead. The category link belongs in the
+    # documentation, so this asserts the form text never carries one. It failed
+    # CI once already, when the link was added to this description.
+    for section in ("user", "data", "data_description"):
+        block = strings["config"]["step"].get(section, {})
+        for key, value in block.items():
+            if isinstance(value, str):
+                assert (
+                    "http://" not in value and "https://" not in value
+                ), f"config.step.user.{section}.{key} carries a URL, which hassfest rejects"
     # The error keys the flow raises must exist in the translations.
     errors = strings["config"]["error"]
     assert "api_key_required" in errors
