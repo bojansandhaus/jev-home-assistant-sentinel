@@ -1,5 +1,54 @@
 # Release notes
 
+## v1.3.0
+
+Adds Cloudflare Clef as a fourth and fifth route. It is additive: the hosted Jev route, the local Laya route, the `laya_then_hosted` chain, and the local failure breaker behave exactly as they did in v1.2.1, and an existing config entry keeps the route it stored. Clef ships two checkpoints of one model, `clef` and `clef-flash`, so the provider count grows by one and the named arrangements by two.
+
+### Added
+
+- `ClefJev`, a provider that reaches Cloudflare Workers AI over the same typed questions in the same `answers` shape. Clef is a Cloudflare hosted decision model rather than a Jev endpoint, so unlike the local route it joins the hosted routes: it can be selected on its own, it can sit in a fallback order, and a chain can put it in front of hosted Jev.
+- The `clef` route and its canonical arrangement name `clef_api`, plus the `clef_then_jev` chain and its arrangement name `clef_with_jev_fallback`. `clef_then_jev` calls Clef first and falls through to hosted Jev, and fails fast when Clef is not configured or when nothing is configured behind it, rather than degrading into a Clef-only route under another name.
+- Two checkpoints of one model, `clef` and `clef-flash`, selected by the `clef_model` config field and the `clef_model` argument of `build_provider`. The checkpoint selects the run path and the model string and never the shape of the answer, so `clef-flash` is not a provider name and `provider_order("clef-flash")` raises `ValueError("invalid provider")`.
+- Question id sanitisation through `clef_question_ids` and `clef_answers`. Clef permits letters, digits, `_`, `.`, and `-` only, at most 100 characters, with at most 64 questions per request. This repository builds ids of the form `candidate:id` and `hook:name`, and `:` is not permitted, so the mapping is load bearing rather than defensive: ids are rewritten into Clef's alphabet before the request and the answer is mapped back, so a caller never sees a renamed question. The mapping is total and injective, including on colliding and over-long names.
+- Both documented response envelopes. The bare model output with a top-level `answers` mapping and Cloudflare's REST envelope with `success: true` and the answers under `result` are both accepted, top level first. A `success: false` envelope raises with Cloudflare's own error code in the message.
+- `validate_answers`, `validate_score_answer`, and `score_index`: one typed answer validation that every route shares. A `choice` outside the rubric's own criteria, a `score` index outside the answer's own legend scale, and a `noul` probability outside `[0, 1]` are refused the same way whatever answered. `confidence_from_score` still clamps, because a caller that only wants a number is better served by a bounded one; validation does not clamp, so a provider cannot widen the scale by reporting a position that does not exist on the legend it sent.
+- `CLEF_MODELS`, `CLEF_DEFAULT_MODEL`, `CLEF_API_BASE`, `CLEF_RUN_PATH`, `CLEF_ID_MAX_LENGTH`, `CLEF_MAX_QUESTIONS`, `CLEF_TIMEOUT`, `CLEF_TOKEN_ENV`, `CLEF_ACCOUNT_ENV`, `CLEF_CHAINED_PROVIDER`, `CLEF_CHECKPOINT_PROVIDER`, and `PROVIDER_REQUIRED_ENV` in the package, and the same names in the Home Assistant runtime bridge.
+- Documentation of the route, its credentials, its privacy boundary, and its failure behaviour in the README, the reference, the integration guide, the FAQ, and the release checklist, and in `strings.json` and `translations/en.json`.
+
+### Changed
+
+- `HOSTED_PROVIDERS` is `("openrouter", "clef")` and `PROVIDER_REQUIRED_ENV` records that Clef needs two variables. A provider counts as configured only when every variable it needs is present, so a route that would call Clef is refused before any request rather than failing partway through one. `provider_order("clef")` raises `ValueError("missing CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID")`.
+- `MODE_NAMES`, `MODE_ALIASES`, and `PROVIDER_MODES` carry five arrangements instead of three. The three existing names are unchanged and every assertion that held about them still holds; the drift test between the two copies of the provider rules was widened to cover the new names and still compares the same rubric, route orders, and confidence mapping.
+- `ChainedJev` now falls through from a hosted hop to the next hop on the documented triggers, where before it only fell through from a hop named `laya`. Without this, a Clef-first chain would have been a single provider wearing a chain's name. The consecutive-failure breaker is unchanged and still guards the local hop only, so the local-first route behaves exactly as in v1.2.1.
+- Clef credentials are read from `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` and are never stored in a config entry, because a Home Assistant config entry is written to disk in plain text. The config flow therefore does not ask for them, and it no longer sends the stored OpenRouter key to a Clef route: a config entry holds one credential and forwarding it to a second provider would put it somewhere it was never meant to reach.
+- `build_provider` gained a `clef_model` argument. The pre-existing routes keep their exact signatures and behaviour; the new argument defaults to `clef`.
+- The three pre-existing tests that pinned the provider vocabulary were widened rather than removed, and the assertions they make about the older routes were kept.
+
+### Privacy and failure behaviour
+
+- A Clef review is hosted, so the redacted case leaves the machine on every call, not only on a fallback. Redaction runs before the request in `SentinelWorkflow.review`, so credential-shaped fields never leave the machine on any route.
+- On failure only the exception class name is logged. The reviewed case, the entity state, the Cloudflare account id, and the token never reach a log record, and a Cloudflare error body's free text is not folded into any exception message: only its `errors` codes are read.
+- A missing credential is reported before any socket work, naming the variable or variables that are absent. A value supplied to the constructor wins over the environment, including a value that is present but empty, so a route selected with no credential of its own can never borrow one from the process environment.
+- An HTTP error keeps its status, so `is_fallback_trigger` still recognises a refusal, a rate limit, or an outage and a chain still falls through. The account id is percent-encoded into the run URL because it is user-supplied text placed in a URL path.
+
+### Limitations
+
+- **No live Clef call was made, and none was possible.** No Cloudflare credential authorized for Workers AI was available on the verification machine: every candidate token was refused with HTTP 401. The Clef route is therefore covered by unit tests with an injected transport only, and its wire details come from Cloudflare's published documentation rather than from an observed reply. Before relying on the route, run one review and read it as a smoke test rather than as evidence that Clef agrees with hosted Jev.
+- Clef's own acceptance of the five-level confidence rubric and its `score` scale are unverified, for the same reason. The mapping is shared with the other routes, so the meaning of `confidence` is identical, but the hosted side needs one live review to confirm it.
+- The default `fallback_order` is still `("openrouter",)`, so the `auto` route does not select Clef until a caller names it there. Clef ships available by configuration, never selected by default order.
+- Clef quality on real Home Assistant cases is unmeasured. There is no agreement study for it, so it carries no accuracy claim.
+- A hosted hop leading to another hosted provider is not guarded by the consecutive-failure breaker, which guards the local hop only. A Clef account that is persistently unavailable therefore costs one failed request per review, which is what the plain hosted route already costs.
+- The counter is still per process and per copy, as in v1.2.1.
+
+### Verification
+
+- Full local suite: 94 passed, 3 skipped, with the three live tests still gated behind `JEV_SENTINEL_LIVE_LAYA`. The Clef suite contributes 37 of those 94. The three skips are the pre-existing opt-in live Laya tests and are unrelated to this release.
+- `python -m pytest`: 94 passed, 3 skipped.
+- Formatting and static gate: `python -m black --check --target-version py311 sentinel custom_components tests`, `python -m isort --check-only sentinel custom_components tests`, `python -m compileall -q sentinel custom_components tests`, `python -m json.tool` on `hacs.json`, on the manifest, and on both `strings.json` and `translations/en.json` all pass. Black needed an explicit `--target-version py311` because the installed Black targets a newer Python than the venv interpreter.
+- The Clef route is proved with an injected synthetic transport: a Clef-only review records exactly one attempt, on the Clef URL, with no attempt on the OpenRouter URL and none on the local Laya URL, so the case reaches neither of the other providers. `clef-flash` records the flash URL and the `clef-flash` model string. Both response envelopes produce the same decision. A `success: false` envelope raises carrying Cloudflare's code. A missing token or a missing account id fails with the variable named and zero recorded attempts, in both copies of the rules. An unknown choice and an out-of-range score index are each refused, and the same numbers are refused by the shared validator on its own. A `candidate:aaa` style id is rewritten to `candidate_aaa` on the wire and restored in the answer. A Clef refusal on the chained route falls through to the OpenRouter hop, which answers, and `raw.provider` and `raw.attempted` record it.
+- The log audit is proved by capture: a rejected answer and a transport failure each log only their exception class name, and the captured text contains neither the synthetic token, the account id, nor a case marker.
+- A config-entry test asserts the form's schema keys by parsing the source, that the checkpoint is declared with the shared constant rather than a repeated literal, and that neither Cloudflare variable appears as a form field.
+
 ## v1.2.1
 
 Adds the local-failure circuit breaker, the three named arrangements, and category-only logging, porting the behaviour the DOGA fork shipped in its v1.3.0. The route surface is unchanged: hosted Jev, local Laya, and the opt-in chain are still the same three routes, and every one of them behaves as before until the breaker trips.

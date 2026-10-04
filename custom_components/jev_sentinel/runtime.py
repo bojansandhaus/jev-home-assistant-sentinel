@@ -6,15 +6,18 @@ The public ``sentinel`` package carries the same provider neutral contract for
 applications and tests outside Home Assistant, including the same rubric and the
 same provider selection rules.
 
-Three routes ship here:
+Routes ship here:
 
 - hosted Jev over an OpenRouter API key;
+- Cloudflare Clef over a Workers AI account and API token, with ``clef`` and
+  ``clef-flash`` as two checkpoints of the one provider;
 - Laya on this machine with no key;
-- Laya first, then the hosted providers that have a key, as an explicit
-  opt-in chain.
+- Laya first, then the hosted providers that are configured, as an explicit
+  opt-in chain;
+- Clef first, then the hosted Jev provider, as an explicit opt-in chain.
 
-The first two are alternatives. The third is the only route that reaches the
-local server and a hosted endpoint in one review.
+The first two are alternatives. The last two are the only routes that reach two
+providers in one review.
 """
 
 from __future__ import annotations
@@ -27,9 +30,9 @@ import threading
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,30 @@ LAYA_ENDPOINT_PATH = "/v1/systemone"
 LAYA_MODEL = "convaiinnovations/laya"
 LAYA_TIMEOUT = 120.0
 _LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+# Clef is a Cloudflare Workers AI decision model. The account id is part of the
+# run URL and is configuration; the API token is the credential. Both are read
+# from the environment and neither is stored in a config entry, because a Home
+# Assistant config entry is written to disk in plain text.
+CLEF_API_BASE = "https://api.cloudflare.com/client/v4/accounts"
+CLEF_RUN_PATH = "/ai/run/@cf/cloudflare/{model}"
+CLEF_DEFAULT_MODEL = "clef"
+CLEF_MODELS = ("clef", "clef-flash")
+CLEF_ACCOUNT_ENV = "CLOUDFLARE_ACCOUNT_ID"
+CLEF_TOKEN_ENV = "CLOUDFLARE_API_TOKEN"
+CLEF_TIMEOUT = 30.0
+# The stored config-entry field that selects the checkpoint. It lives here so
+# the config flow and the entry builder cannot drift apart on the spelling.
+CLEF_CHECKPOINT_FIELD = "clef_model"
+
+# Clef accepts question ids of letters, digits, '_', '.', and '-', at most 100
+# characters, with at most 64 questions per request. This repository builds ids
+# of the form "candidate:id" and "hook:name", and ':' is not permitted, so the
+# id mapping is load bearing and the answer is mapped back to the caller's own
+# names.
+CLEF_ID_ALLOWED = re.compile(r"\A[A-Za-z0-9_.-]+\Z")
+CLEF_ID_MAX_LENGTH = 100
+CLEF_MAX_QUESTIONS = 64
 
 # A failed attempt falls through to the next provider in a chain only when the
 # provider was unreachable, refused, rate limited, or broken. Any other status,
@@ -93,26 +120,36 @@ def note_local_failure(exc: BaseException) -> bool:
         return _local_failure_count <= LOCAL_FALLBACK_FAILURE_LIMIT
 
 
-# The three named arrangements, in the vocabulary the DOGA fork uses. Each name
+# The named arrangements, in the vocabulary the DOGA fork uses. Each name
 # resolves onto exactly one of the canonical route names above.
 MODE_ALIASES = {
     "jev_api": "openrouter",
     "laya_local": "laya",
     "laya_with_jev_fallback": "laya_then_hosted",
+    "clef_api": "clef",
+    "clef_with_jev_fallback": "clef_then_jev",
 }
-MODE_NAMES = ("jev_api", "laya_local", "laya_with_jev_fallback")
+MODE_NAMES = (
+    "jev_api",
+    "laya_local",
+    "laya_with_jev_fallback",
+    "clef_api",
+    "clef_with_jev_fallback",
+)
 PROVIDER_MODES = {
     "openrouter": "jev_api",
     "laya": "laya_local",
     "laya_then_hosted": "laya_with_jev_fallback",
+    "clef": "clef_api",
+    "clef_then_jev": "clef_with_jev_fallback",
 }
 
 
 def resolve_provider(name: object) -> str:
     """Map a mode name or a canonical route name onto the canonical route name.
 
-    Only the three named arrangements are rewritten, and each is recognised in
-    either case. Any other value, including a canonical route name, is returned
+    Only the named arrangements are rewritten, and each is recognised in either
+    case. Any other value, including a canonical route name, is returned
     unchanged so the existing validation still decides whether it is valid.
     """
     if not isinstance(name, str):
@@ -129,11 +166,25 @@ def provider_mode(provider: str) -> str:
     return PROVIDER_MODES[canonical]
 
 
-HOSTED_PROVIDERS = ("openrouter",)
+HOSTED_PROVIDERS = ("openrouter", "clef")
 LOCAL_PROVIDERS = ("laya",)
 CHAINED_PROVIDER = "laya_then_hosted"
-PROVIDER_NAMES = ("auto",) + HOSTED_PROVIDERS + LOCAL_PROVIDERS + (CHAINED_PROVIDER,)
-PROVIDER_ENV = {"openrouter": "OPENROUTER_API_KEY", "laya": "LAYA_API_KEY"}
+CLEF_CHECKPOINT_PROVIDER = "clef"
+CLEF_CHAINED_PROVIDER = "clef_then_jev"
+PROVIDER_NAMES = (
+    ("auto",)
+    + HOSTED_PROVIDERS
+    + LOCAL_PROVIDERS
+    + (CHAINED_PROVIDER, CLEF_CHAINED_PROVIDER)
+)
+PROVIDER_ENV = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "laya": "LAYA_API_KEY",
+    "clef": CLEF_TOKEN_ENV,
+}
+# Clef needs a credential and a configuration value, so it is configured only
+# when both are present.
+PROVIDER_REQUIRED_ENV = {"clef": (CLEF_TOKEN_ENV, CLEF_ACCOUNT_ENV)}
 DEFAULT_FALLBACK_ORDER = ("openrouter",)
 LOCAL_PROVIDER = "laya"
 
@@ -238,6 +289,86 @@ def decision_questions() -> dict[str, dict]:
     }
 
 
+def _legend_count(answer: dict, levels: tuple[str, ...]) -> int:
+    """The number of levels a score answer's index scale has."""
+    legend = answer.get("legend")
+    return len(legend) if isinstance(legend, (dict, list)) else len(levels)
+
+
+def score_index(answer: object, *, levels: tuple[str, ...] = CONFIDENCE_LEVELS):
+    """The expected level index a score answer reports, or ``None``."""
+    if not isinstance(answer, dict):
+        return None
+    score = answer.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    return float(score)
+
+
+def validate_score_answer(
+    answer: object, *, levels: tuple[str, ...] = CONFIDENCE_LEVELS
+) -> None:
+    """Reject a score answer whose index is not on its own legend scale.
+
+    A ``score`` answer is a position on the index scale ``0`` to
+    ``len(legend) - 1``. An index outside that range, or an answer with no
+    numeric index at all, is a provider answer this repository does not accept,
+    so it raises instead of being silently clamped the way
+    ``confidence_from_score`` clamps for a caller that merely wants a number.
+    """
+    if not isinstance(answer, dict):
+        raise ValueError("invalid score answer: no numeric score index")
+    score = score_index(answer, levels=levels)
+    if score is None:
+        raise ValueError("invalid score answer: no numeric score index")
+    count = _legend_count(answer, levels)
+    if count < 2:
+        raise ValueError("invalid score answer: the legend needs at least two levels")
+    if not 0 <= score <= count - 1:
+        raise ValueError(
+            f"invalid score answer: index {score:g} is outside the"
+            f" 0 to {count - 1} legend scale"
+        )
+
+
+def validate_answers(
+    answers: object, questions: dict[str, dict], *, label: str
+) -> dict[str, Any]:
+    """Check a Decisions shaped answer against the rubric that asked for it.
+
+    The one typed answer validation every route shares, so an unknown choice or
+    an out-of-range score index is refused the same way whatever answered.
+    """
+    if not isinstance(answers, dict):
+        raise ValueError(f"invalid {label} response: answers must be a mapping")
+    for name, question in questions.items():
+        answer = answers.get(name)
+        if not isinstance(answer, dict):
+            raise ValueError(f"invalid {label} response: missing answer for {name!r}")
+        kind = question.get("type")
+        if kind == "choice":
+            if answer.get("choice") not in question.get("criteria", {}):
+                raise ValueError(
+                    f"invalid {label} response: unknown choice for {name!r}"
+                )
+        elif kind == "score":
+            try:
+                validate_score_answer(answer)
+            except ValueError as exc:
+                raise ValueError(f"invalid {label} response: {exc}") from None
+        elif kind == "noul":
+            probability = answer.get("noul")
+            if (
+                isinstance(probability, bool)
+                or not isinstance(probability, (int, float))
+                or not 0 <= probability <= 1
+            ):
+                raise ValueError(
+                    f"invalid {label} response: invalid probability for {name!r}"
+                )
+    return answers
+
+
 def confidence_from_score(
     answer: object, *, levels: tuple[str, ...] = CONFIDENCE_LEVELS
 ) -> float | None:
@@ -255,14 +386,13 @@ def confidence_from_score(
     """
     if not isinstance(answer, dict):
         return None
-    score = answer.get("score")
-    if isinstance(score, bool) or not isinstance(score, (int, float)):
+    score = score_index(answer, levels=levels)
+    if score is None:
         return None
-    legend = answer.get("legend")
-    count = len(legend) if isinstance(legend, (dict, list)) else len(levels)
+    count = _legend_count(answer, levels)
     if count < 2:
         return None
-    return min(1.0, max(0.0, float(score) / (count - 1)))
+    return min(1.0, max(0.0, score / (count - 1)))
 
 
 def decision_from_body(body: dict, *, model: str = MODEL) -> Decision:
@@ -305,6 +435,294 @@ class OpenRouterJev:
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
         return decision_from_body(body, model=MODEL)
+
+
+def clef_checkpoint(model: str | None = None) -> str:
+    """The Clef checkpoint to call, validated.
+
+    Clef Flash is the smaller checkpoint Cloudflare documents for latency bound
+    paths. Both answer the same typed questions, so it is a checkpoint of one
+    provider and not a provider of its own. An unset or blank name means the
+    default; any other unknown name raises.
+    """
+    candidate = (model or "").strip().lower() or CLEF_DEFAULT_MODEL
+    if candidate not in CLEF_MODELS:
+        raise ValueError("invalid Clef checkpoint: " + ", ".join(CLEF_MODELS))
+    return candidate
+
+
+def _require_clef_credentials(
+    account: str | None, token: str | None, env: Mapping[str, str]
+) -> tuple[str, str]:
+    """The account id and token to use, and the name of anything missing.
+
+    Both are checked before any socket work. A constructor value wins over the
+    environment, including a value that is present but empty: an empty
+    credential is a missing credential, so it must never be topped up from the
+    process environment.
+    """
+    resolved_account = (
+        account if account is not None else (env.get(CLEF_ACCOUNT_ENV) or "")
+    ).strip()
+    resolved_token = (
+        token if token is not None else (env.get(CLEF_TOKEN_ENV) or "")
+    ).strip()
+    missing = [
+        name
+        for name, value in (
+            (CLEF_TOKEN_ENV, resolved_token),
+            (CLEF_ACCOUNT_ENV, resolved_account),
+        )
+        if not value
+    ]
+    if len(missing) == 1:
+        raise RuntimeError(f"{missing[0]} is required for live Clef decisions")
+    if missing:
+        raise RuntimeError(
+            " and ".join(missing) + " are required for live Clef decisions"
+        )
+    return resolved_account, resolved_token
+
+
+def clef_credentials(env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """The Cloudflare account id and API token from the environment.
+
+    The account id is configuration and the token is the credential, but both
+    are required before a request is made, and the message names the variable
+    that is missing rather than anything about the value.
+    """
+    return _require_clef_credentials(None, None, os.environ if env is None else env)
+
+
+def clef_endpoint(account: str, model: str = CLEF_DEFAULT_MODEL) -> str:
+    """The Workers AI run URL for one account and checkpoint.
+
+    The account id is percent encoded, because it is user supplied text placed
+    in a URL path.
+    """
+    if not account.strip():
+        raise ValueError("invalid Clef account id")
+    checkpoint = clef_checkpoint(model)
+    return (
+        CLEF_API_BASE
+        + "/"
+        + quote(account.strip(), safe="")
+        + CLEF_RUN_PATH.format(model=checkpoint)
+    )
+
+
+def clef_question_ids(
+    questions: dict[str, dict],
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Rename question ids into Clef's id alphabet and return the way back.
+
+    An id already in the alphabet passes through untouched, a rewritten id that
+    would collide is suffixed until it does not, and the returned
+    ``safe -> original`` map restores the caller's own names.
+    """
+    if len(questions) > CLEF_MAX_QUESTIONS:
+        raise ValueError(
+            f"invalid Clef request: {len(questions)} questions exceeds the"
+            f" limit of {CLEF_MAX_QUESTIONS}"
+        )
+    safe_questions: dict[str, dict] = {}
+    restore: dict[str, str] = {}
+
+    def _unique(base: str) -> str:
+        candidate = base
+        suffix = 2
+        while candidate in restore:
+            tail = f"-{suffix}"
+            room = CLEF_ID_MAX_LENGTH - len(tail)
+            candidate = base[: max(1, room)] + tail
+            suffix += 1
+        return candidate
+
+    for name, question in questions.items():
+        base = "".join(
+            char if CLEF_ID_ALLOWED.match(char) else "_" for char in str(name)
+        ).strip("_")
+        if not base:
+            base = "question"
+        if len(base) > CLEF_ID_MAX_LENGTH:
+            base = base[:CLEF_ID_MAX_LENGTH].strip("_") or "question"
+        safe = base if CLEF_ID_ALLOWED.match(base) else _unique(base)
+        if safe in restore:
+            safe = _unique(base)
+        restore[safe] = str(name)
+        safe_questions[safe] = question
+    return safe_questions, restore
+
+
+def clef_answers(
+    body: object,
+    questions: dict[str, dict],
+    *,
+    restore: dict[str, str] | None = None,
+    model: str = CLEF_DEFAULT_MODEL,
+    label: str = "Cloudflare Clef",
+) -> dict[str, Any]:
+    """Unwrap a Clef reply, restore the caller's question ids, and validate it.
+
+    Cloudflare serves Clef from a REST endpoint that answers with the model
+    output directly, while its general API surface wraps results in a
+    ``success``/``result`` envelope. Both are accepted and a top level
+    ``answers`` mapping wins over ``result.answers``. A ``success: false``
+    envelope carries Cloudflare's own error codes, which are surfaced rather
+    than swallowed.
+    """
+    if not isinstance(body, dict):
+        raise RuntimeError(f"{label} returned an invalid response")
+    if body.get("success") is False:
+        codes = [
+            str(error.get("code"))
+            for error in (body.get("errors") or [])
+            if isinstance(error, dict) and error.get("code") is not None
+        ]
+        detail = ", ".join(codes) if codes else "unknown error"
+        raise RuntimeError(f"{label} request failed with Cloudflare code {detail}")
+    answers = body.get("answers")
+    if not isinstance(answers, dict):
+        inner = body.get("result")
+        answers = inner.get("answers") if isinstance(inner, dict) else None
+    if not isinstance(answers, dict):
+        raise RuntimeError(f"{label} returned an invalid response")
+    if restore:
+        restored: dict[str, Any] = {}
+        for key, answer in answers.items():
+            safe_id = str(key)
+            restored[restore.get(safe_id, safe_id)] = answer
+        answers = restored
+    validate_answers(answers, questions, label=label)
+    return {"model": body.get("model", model), "answers": answers}
+
+
+def _cloudflare_error_detail(exc: HTTPError, *, limit: int = 2000) -> str:
+    """Cloudflare's own error codes from an HTTP error body, if it carries any.
+
+    Only the ``errors`` codes are used. No other part of a Cloudflare error body
+    reaches a log record or an exception message.
+    """
+    try:
+        raw = exc.read(limit)
+    except Exception:  # a body that cannot be read is not an error here
+        return ""
+    try:
+        body = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    codes = [
+        str(error.get("code"))
+        for error in (body.get("errors") or [])
+        if isinstance(error, dict) and error.get("code") is not None
+    ]
+    return ", ".join(codes)
+
+
+class ClefJev:
+    """Cloudflare Clef over a Workers AI account and API token.
+
+    Clef is not a Jev endpoint. It is a Cloudflare hosted decision model that
+    answers the same typed questions in the same ``answers`` shape, so selecting
+    it joins the hosted routes and can sit in a fallback order, instead of
+    replacing one the way the local route does.
+
+    Two checkpoints of one model ship: ``clef`` and ``clef-flash``. The
+    checkpoint selects the run path and the model string, and never the shape of
+    the answer.
+
+    The account id and the API token are read from ``CLOUDFLARE_ACCOUNT_ID`` and
+    ``CLOUDFLARE_API_TOKEN`` and are checked before any socket work. On failure
+    only the exception class name is logged: the reviewed case, the entity
+    state, the account, and the token never reach a log record.
+    """
+
+    def __init__(
+        self,
+        api_token: str | None = None,
+        *,
+        account_id: str | None = None,
+        model: str = CLEF_DEFAULT_MODEL,
+        timeout: float = CLEF_TIMEOUT,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        # The source this adapter resolves against, remembered so a later
+        # decide() consults the same environment it was built from rather than
+        # the process environment, which may hold unrelated credentials.
+        self.env: Mapping[str, str] = os.environ if env is None else env
+        self.api_token = (
+            api_token
+            if api_token is not None
+            else (self.env.get(CLEF_TOKEN_ENV) or "").strip()
+        )
+        self.account_id = (
+            account_id
+            if account_id is not None
+            else (self.env.get(CLEF_ACCOUNT_ENV) or "").strip()
+        )
+        self.model = clef_checkpoint(model)
+        self.timeout = timeout
+
+    def _credentials(self, env: Mapping[str, str] | None = None) -> tuple[str, str]:
+        return _require_clef_credentials(
+            self.account_id or None,
+            self.api_token or None,
+            self.env if env is None else env,
+        )
+
+    def decide(self, state: dict[str, Any]) -> Decision:
+        account, token = self._credentials()
+        questions = decision_questions()
+        safe_questions, restore = clef_question_ids(questions)
+        payload = {
+            "model": self.model,
+            "state": state,
+            "questions": safe_questions,
+        }
+        request = Request(
+            clef_endpoint(account, self.model),
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                body = json.loads(response.read().decode())
+        except HTTPError as exc:
+            # Cloudflare's error codes are more useful than the bare status, so
+            # a coded body is folded into the message while the type and status
+            # are preserved: a chain must still recognise this as a refusal or a
+            # provider failure and fall through to its next hop.
+            detail = _cloudflare_error_detail(exc)
+            if detail:
+                logger.warning("clef decision failed (%s)", type(exc).__name__)
+                raise HTTPError(
+                    exc.url,
+                    exc.code,
+                    f"HTTP {exc.code} (Cloudflare code {detail})",
+                    exc.headers,
+                    exc.fp,
+                ) from exc
+            logger.warning("clef decision failed (%s)", type(exc).__name__)
+            raise
+        except Exception as exc:
+            # Only the exception category is logged. The case, the account, and
+            # the token stay out of the log record.
+            logger.warning("clef decision failed (%s)", type(exc).__name__)
+            raise
+        try:
+            normalised = clef_answers(
+                body, questions, restore=restore, model=self.model
+            )
+        except Exception as exc:
+            logger.warning("clef decision failed (%s)", type(exc).__name__)
+            raise
+        return decision_from_body(normalised, model=self.model)
 
 
 def laya_endpoint(
@@ -410,22 +828,28 @@ class ChainedJev:
             try:
                 decision = provider.decide(state)
             except Exception as exc:
-                if (
-                    index + 1 < len(self.providers)
-                    and is_fallback_trigger(exc)
-                    and name == LOCAL_PROVIDER
-                ):
-                    # A local failure that qualifies for the hosted fallback is
-                    # counted. Past the limit the local error is raised instead
-                    # of being answered remotely, so a local server that stays
-                    # down cannot send every case to a hosted API.
-                    if note_local_failure(exc):
+                if index + 1 < len(self.providers) and is_fallback_trigger(exc):
+                    if name == LOCAL_PROVIDER:
+                        # A local failure that qualifies for the hosted fallback
+                        # is counted. Past the limit the local error is raised
+                        # instead of being answered remotely, so a local server
+                        # that stays down cannot send every case to a hosted
+                        # API. The breaker guards the local hop only: a hosted
+                        # hop in front of another hosted provider is bounded by
+                        # the order, not by a counter.
+                        if note_local_failure(exc):
+                            continue
+                        logger.warning(
+                            "hosted fallback suppressed after %d consecutive"
+                            " local failures",
+                            LOCAL_FALLBACK_FAILURE_LIMIT,
+                        )
+                    else:
+                        # A hosted hop that was refused, rate limited, or
+                        # unreachable falls through to the next hop. This is what
+                        # makes a hosted-only chain such as Clef then hosted Jev
+                        # a chain rather than a single provider.
                         continue
-                    logger.warning(
-                        "hosted fallback suppressed after %d consecutive"
-                        " local failures",
-                        LOCAL_FALLBACK_FAILURE_LIMIT,
-                    )
                 raise
             return self._attributed(decision, index)
         raise RuntimeError("the chain has no provider left to call")
@@ -435,6 +859,17 @@ class ChainedJev:
         raw["provider"] = self.providers[index][0]
         raw["attempted"] = list(self.names[: index + 1])
         return replace(decision, raw=raw)
+
+
+def _configured(name: str, env: Mapping[str, str]) -> bool:
+    """Whether a provider has every variable it needs, in this environment."""
+    required = PROVIDER_REQUIRED_ENV.get(name, (PROVIDER_ENV[name],))
+    return all((env.get(var) or "").strip() for var in required)
+
+
+def _missing_names(name: str) -> str:
+    """The variable names a provider needs, for a failure message."""
+    return " and ".join(PROVIDER_REQUIRED_ENV.get(name, (PROVIDER_ENV[name],)))
 
 
 def validate_fallback_order(order: tuple[str, ...] | list[str]) -> tuple[str, ...]:
@@ -467,13 +902,13 @@ def provider_order(
     if provider == LOCAL_PROVIDER:
         return [LOCAL_PROVIDER]
     source = os.environ if env is None else env
-    keys = {name: source.get(var, "").strip() for name, var in PROVIDER_ENV.items()}
+    configured = {name: _configured(name, source) for name in HOSTED_PROVIDERS}
     if provider == CHAINED_PROVIDER:
         # The chain starts on the local server, so it needs at least one hosted
-        # hop behind it. Without a hosted key there is no fallback to route to,
-        # and returning the local hop alone would silently turn the chained
-        # route into the local-only route.
-        hosted = [name for name in order if keys[name]]
+        # hop behind it. Without a configured hosted provider there is no
+        # fallback to route to, and returning the local hop alone would silently
+        # turn the chained route into the local-only route.
+        hosted = [name for name in order if configured[name]]
         if not hosted:
             raise ValueError(
                 "missing "
@@ -483,20 +918,48 @@ def provider_order(
                 + " route"
             )
         return [LOCAL_PROVIDER] + hosted
+    if provider == CLEF_CHAINED_PROVIDER:
+        # Clef first, then the hosted order behind it. Clef itself must be
+        # configured, and a configured hop must exist behind it.
+        if not configured[CLEF_CHECKPOINT_PROVIDER]:
+            raise ValueError("missing " + _missing_names(CLEF_CHECKPOINT_PROVIDER))
+        hosted = [
+            name
+            for name in order
+            if name != CLEF_CHECKPOINT_PROVIDER and configured[name]
+        ]
+        if not hosted:
+            raise ValueError(
+                "no configured hosted provider behind Clef for the "
+                + CLEF_CHAINED_PROVIDER
+                + " route"
+            )
+        return [CLEF_CHECKPOINT_PROVIDER, *hosted]
     if provider == "auto":
-        return [name for name in order if keys[name]]
-    if not keys[provider]:
-        raise ValueError("missing " + PROVIDER_ENV[provider])
+        return [name for name in order if configured[name]]
+    if not configured[provider]:
+        raise ValueError("missing " + _missing_names(provider))
     return [provider]
 
 
 def _hosted_adapter(
-    name: str, api_key: str | None, timeout: float | None
-) -> "OpenRouterJev":
+    name: str,
+    api_key: str | None,
+    timeout: float | None,
+    env: dict[str, str],
+    clef_model: str = CLEF_DEFAULT_MODEL,
+) -> "OpenRouterJev | ClefJev":
     """Build the adapter for one hosted provider name."""
-    if name != "openrouter":
-        raise ValueError("invalid provider")
-    return OpenRouterJev(api_key, timeout=30.0 if timeout is None else timeout)
+    if name == "openrouter":
+        return OpenRouterJev(api_key, timeout=30.0 if timeout is None else timeout)
+    if name == CLEF_CHECKPOINT_PROVIDER:
+        return ClefJev(
+            api_key,
+            model=clef_model,
+            timeout=30.0 if timeout is None else timeout,
+            env=env,
+        )
+    raise ValueError("invalid provider")
 
 
 def build_provider(
@@ -505,16 +968,17 @@ def build_provider(
     api_key: str | None = None,
     laya_base_url: str = LAYA_BASE_URL,
     laya_model: str = LAYA_MODEL,
+    clef_model: str = CLEF_DEFAULT_MODEL,
     timeout: float | None = None,
     fallback_order: tuple[str, ...] | list[str] = DEFAULT_FALLBACK_ORDER,
     env: dict[str, str] | None = None,
-) -> "OpenRouterJev | LayaJev | ChainedJev":
+) -> "OpenRouterJev | ClefJev | LayaJev | ChainedJev":
     """Build the adapter for the configured route.
 
-    On the chained route ``api_key`` is the hosted key and the local hop keeps
-    its own optional ``LAYA_API_KEY``. An explicit hosted key also supplies the
-    key for the route check, so a caller that holds the key in its own
-    configuration does not need it in the environment as well.
+    On the chained routes ``api_key`` is the OpenRouter hosted key and the local
+    hop keeps its own optional ``LAYA_API_KEY``. An explicit hosted key also
+    supplies the key for the route check, so a caller that holds the key in its
+    own configuration does not need it in the environment as well.
     """
     source = dict(os.environ if env is None else env)
     provider = resolve_provider(provider)
@@ -533,9 +997,25 @@ def build_provider(
             api_key=api_key,
             timeout=LAYA_TIMEOUT if timeout is None else timeout,
         )
+    if provider == CLEF_CHAINED_PROVIDER:
+        return ChainedJev(
+            [
+                (
+                    name,
+                    _hosted_adapter(
+                        name,
+                        source.get(PROVIDER_ENV[name]) or None,
+                        timeout,
+                        source,
+                        clef_model,
+                    ),
+                )
+                for name in order
+            ]
+        )
     if order[0] == LOCAL_PROVIDER:
-        # The chained route. The local hop comes first and needs no hosted key,
-        # so ``api_key`` belongs to the hosted hops only.
+        # The local-first chain. The local hop comes first and needs no hosted
+        # key, so ``api_key`` belongs to the hosted hops only.
         local = LayaJev(
             laya_base_url,
             model=laya_model,
@@ -545,13 +1025,23 @@ def build_provider(
             (
                 name,
                 _hosted_adapter(
-                    name, source.get(PROVIDER_ENV[name], "") or None, timeout
+                    name,
+                    source.get(PROVIDER_ENV[name]) or None,
+                    timeout,
+                    source,
+                    clef_model,
                 ),
             )
             for name in order[1:]
         ]
         return ChainedJev([(LOCAL_PROVIDER, local), *hosted])
-    return _hosted_adapter(order[0], api_key, timeout)
+    return _hosted_adapter(
+        order[0],
+        source.get(PROVIDER_ENV[order[0]]) or None,
+        timeout,
+        source,
+        clef_model,
+    )
 
 
 def redact(value: Any) -> Any:

@@ -3,24 +3,25 @@
     "step": {
       "user": {
         "title": "Connect Jev Home Assistant Sentinel",
-        "description": "Choose one route. Hosted Jev runs over the OpenRouter API key. Laya runs on this machine with no API key. Laya first with the hosted key as fallback asks the local server first, then sends the same redacted case to the hosted endpoint if the local server fails.",
+        "description": "Choose one route. Hosted Jev runs over the OpenRouter API key. Laya runs on this machine with no API key. Laya first with the hosted key as fallback asks the local server first, then sends the same redacted case to the hosted endpoint if the local server fails. Cloudflare Clef runs over a Workers AI account and API token read from the CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN environment variables, which is why this form does not ask for them: a config entry is stored on disk in plain text. Clef first with hosted Jev as fallback calls Clef, then sends the same redacted case to the hosted Jev endpoint if Clef is unreachable, refused, rate limited, or broken.",
         "data": {
           "provider": "Provider",
           "api_key": "OpenRouter API key",
           "laya_base_url": "Laya base URL",
-          "laya_model": "Laya checkpoint"
+          "laya_model": "Laya checkpoint",
+          "clef_model": "Clef checkpoint"
         }
       }
     },
     "error": {
-      "api_key_required": "The hosted routes need an OpenRouter API key. Select Laya alone only when a local laya-serve is running."
+      "api_key_required": "The routes that reach hosted Jev need an OpenRouter API key. Select Laya alone only when a local laya-serve is running, or Clef when CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set in the environment."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Sentinel options",
-        "description": "Sentinel remains advisory in v1.2.0. This option is retained for forward compatibility.",
+        "description": "Sentinel remains advisory in v1.3.0. This option is retained for forward compatibility.",
         "data": {
           "shadow": "Shadow mode"
         }

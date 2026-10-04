@@ -6,6 +6,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 
 from .runtime import (
+    CLEF_CHAINED_PROVIDER,
+    CLEF_CHECKPOINT_FIELD,
+    CLEF_DEFAULT_MODEL,
     LAYA_BASE_URL,
     LAYA_MODEL,
     LOCAL_PROVIDER,
@@ -21,24 +24,40 @@ DOMAIN = "jev_sentinel"
 PLATFORMS = ["sensor"]
 DEFAULT_PROVIDER = "openrouter"
 
+# The routes that never take the stored OpenRouter key, because Clef carries its
+# own credential from the environment.
+CLEF_ROUTES = ("clef", CLEF_CHAINED_PROVIDER)
+
 
 def _provider_for(entry: ConfigEntry):
     """Build the configured route.
 
-    A hosted route, a local Laya route, or the explicit ``laya_then_hosted``
-    chain. A mode name such as ``jev_api``, ``laya_local``, or
-    ``laya_with_jev_fallback`` names the same route and is accepted here. An
-    entry without a ``provider`` field keeps the hosted route.
+    A hosted route, a local Laya route, the explicit ``laya_then_hosted``
+    chain, or a Clef route. A mode name such as ``jev_api``, ``laya_local``,
+    ``laya_with_jev_fallback``, ``clef_api``, or ``clef_with_jev_fallback``
+    names the same route and is accepted here. An entry without a ``provider``
+    field keeps the hosted route.
+
+    ``api_key`` is the stored OpenRouter key and belongs to the hosted Jev hops.
+    Clef reads its own token and account id from the environment, so the stored
+    key is not forwarded to it: a config entry holds one credential, and sending
+    it to a second provider would put it somewhere it was never meant to reach.
     """
     provider = resolve_provider(entry.data.get("provider", DEFAULT_PROVIDER))
+    stored_key = entry.data.get("api_key")
+    if provider in CLEF_ROUTES:
+        stored_key = None
     return build_provider(
         provider,
         # The stored key belongs to the hosted hops. The local hop stays keyless
         # unless laya-serve was started with its own bearer check, in which case
         # LAYA_API_KEY supplies it.
-        api_key=None if provider == LOCAL_PROVIDER else entry.data.get("api_key"),
+        api_key=None if provider == LOCAL_PROVIDER else stored_key,
         laya_base_url=entry.data.get("laya_base_url") or LAYA_BASE_URL,
         laya_model=entry.data.get("laya_model") or LAYA_MODEL,
+        # The Clef checkpoint is a setting of the route, so an entry that never
+        # set one keeps the default rather than calling an unknown checkpoint.
+        clef_model=entry.data.get(CLEF_CHECKPOINT_FIELD) or CLEF_DEFAULT_MODEL,
     )
 
 

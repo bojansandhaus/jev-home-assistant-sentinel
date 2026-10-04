@@ -306,12 +306,20 @@ def test_the_runtime_bridge_carries_the_same_rules_as_the_package():
     assert _runtime.PROVIDER_ENV == {
         "openrouter": "OPENROUTER_API_KEY",
         "laya": "LAYA_API_KEY",
+        "clef": "CLOUDFLARE_API_TOKEN",
     }
     assert _runtime.DEFAULT_FALLBACK_ORDER == ("openrouter",)
     assert _runtime.provider_order("laya") == ["laya"]
     assert _runtime.provider_order("auto", env={}) == []
     assert _runtime.CHAINED_PROVIDER == CHAINED_PROVIDER
-    assert _runtime.PROVIDER_NAMES == ("auto", "openrouter", "laya", CHAINED_PROVIDER)
+    assert _runtime.PROVIDER_NAMES == (
+        "auto",
+        "openrouter",
+        "clef",
+        "laya",
+        CHAINED_PROVIDER,
+        "clef_then_jev",
+    )
     assert _runtime.FALLBACK_STATUS_CODES == FALLBACK_STATUS_CODES
     assert _runtime.is_fallback_trigger(TimeoutError()) is True
     assert _runtime.is_fallback_trigger(_http_error(422)) is False
@@ -349,15 +357,26 @@ def test_the_runtime_bridge_carries_the_same_rules_as_the_package():
         "jev_api",
         "laya_local",
         "laya_with_jev_fallback",
+        "clef_api",
+        "clef_with_jev_fallback",
         "JEV_API",
+        "CLEF_API",
         "openrouter",
+        "clef",
         LOCAL_PROVIDER,
         CHAINED_PROVIDER,
+        "clef_then_jev",
         "Laya",
         "typesafe",
     ):
         assert _runtime.resolve_provider(name) == resolve_provider(name)
-    for provider in ("openrouter", LOCAL_PROVIDER, CHAINED_PROVIDER):
+    for provider in (
+        "openrouter",
+        "clef",
+        LOCAL_PROVIDER,
+        CHAINED_PROVIDER,
+        "clef_then_jev",
+    ):
         assert _runtime.provider_mode(provider) == provider_mode(provider)
     for module in (sys.modules["sentinel.jev"], _runtime):
         module.reset_local_failures()
@@ -614,10 +633,13 @@ def test_the_config_flow_offers_the_chained_route_and_keeps_the_hosted_default()
     for name in ('"openrouter"', "LOCAL_PROVIDER", "CHAINED_PROVIDER"):
         assert name in flow
     assert "api_key_required" in flow
-    # The config flow offers the three named arrangements and resolves the
-    # aliases onto the canonical routes before it validates the key.
+    # The config flow offers every named arrangement and resolves the aliases
+    # onto the canonical routes before it validates the key. The set grew with
+    # Clef in v1.3.0; the three the earlier releases named are still offered.
     for mode in MODE_NAMES:
         assert mode in flow
+    for name in MODE_ALIASES:
+        assert name in flow
     assert "resolve_provider" in flow
 
 
@@ -742,16 +764,30 @@ def _weak_answered(choice="ignore", score=0.0, action="none"):
 
 
 def test_the_named_arrangements_resolve_onto_their_routes():
-    assert MODE_NAMES == ("jev_api", "laya_local", "laya_with_jev_fallback")
+    # Clef arrived in v1.3.0 as a fourth hosted provider and a fifth arrangement,
+    # so the three the earlier releases pinned are now a subset of a larger set.
+    # Every assertion about them still holds; the new names are covered by
+    # tests/test_clef_provider.py and asserted here only as vocabulary.
+    assert MODE_NAMES == (
+        "jev_api",
+        "laya_local",
+        "laya_with_jev_fallback",
+        "clef_api",
+        "clef_with_jev_fallback",
+    )
     assert MODE_ALIASES == {
         "jev_api": "openrouter",
         "laya_local": LOCAL_PROVIDER,
         "laya_with_jev_fallback": CHAINED_PROVIDER,
+        "clef_api": "clef",
+        "clef_with_jev_fallback": "clef_then_jev",
     }
     assert PROVIDER_MODES == {
         "openrouter": "jev_api",
         LOCAL_PROVIDER: "laya_local",
         CHAINED_PROVIDER: "laya_with_jev_fallback",
+        "clef": "clef_api",
+        "clef_then_jev": "clef_with_jev_fallback",
     }
     for alias, canonical in MODE_ALIASES.items():
         assert resolve_provider(alias) == canonical
@@ -762,6 +798,10 @@ def test_the_named_arrangements_resolve_onto_their_routes():
             {"OPENROUTER_API_KEY": "private"},
             {"LAYA_API_KEY": "private"},
             {"TYPESAFE_API_KEY": "private"},
+            {
+                "CLOUDFLARE_API_TOKEN": "private",
+                "CLOUDFLARE_ACCOUNT_ID": "private-account",
+            },
         ):
             assert _outcome(provider_order, alias, env) == _outcome(
                 provider_order, canonical, env
@@ -773,6 +813,16 @@ def test_the_named_arrangements_resolve_onto_their_routes():
     chained = build_provider("laya_with_jev_fallback", api_key="private", env={})
     assert isinstance(chained, ChainedJev)
     assert chained.names == (LOCAL_PROVIDER, "openrouter")
+    assert resolve_provider("Laya") == "Laya"
+    assert resolve_provider("typesafe") == "typesafe"
+    assert resolve_provider("") == ""
+    assert resolve_provider(None) == ""
+    with pytest.raises(ValueError, match="invalid provider"):
+        provider_order("Laya")
+    with pytest.raises(ValueError, match="invalid provider"):
+        provider_mode("Laya")
+    with pytest.raises(ValueError, match="invalid provider"):
+        provider_mode("auto")
     # A value that is not one of the three named arrangements is left alone, so
     # the existing validation still rejects it exactly as before.
     assert resolve_provider("Laya") == "Laya"

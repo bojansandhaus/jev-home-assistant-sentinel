@@ -43,7 +43,28 @@ No. A service-call return is dispatch evidence. Read the target state and pass t
 
 ## Can I use another model?
 
-The integration offers three routes, each with a name. `jev_api` runs hosted Jev over the OpenRouter key with `typesafe/jev-1.13`. `laya_local` runs Laya locally with no key. Those two are alternatives rather than members of one chain. `laya_with_jev_fallback` is an explicit opt-in chain that answers from Laya first and falls through to hosted Jev. Choose one in the config flow; the canonical route names `openrouter`, `laya`, and `laya_then_hosted` are accepted as aliases for the three arrangement names. The standalone core also accepts any other `DecisionProvider`, so a custom provider can implement `decide(state)` outside the integration adapter.
+The integration offers five routes, each with a name. `jev_api` runs hosted Jev over the OpenRouter key with `typesafe/jev-1.13`. `clef_api` runs Cloudflare Clef, a hosted decision model that answers the same typed questions, over a Workers AI account and token from the environment. `laya_local` runs Laya locally with no key. The three single-provider routes are alternatives rather than members of one chain. `laya_with_jev_fallback` and `clef_with_jev_fallback` are explicit opt-in chains that answer from the first provider and fall through to hosted Jev. Choose one in the config flow; the canonical route names `openrouter`, `clef`, `laya`, `laya_then_hosted`, and `clef_then_jev` are accepted as aliases for the five arrangement names. The standalone core also accepts any other `DecisionProvider`, so a custom provider can implement `decide(state)` outside the integration adapter.
+
+## What does the Cloudflare Clef route need?
+
+Two environment variables, and nothing in the config flow: `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`. The account id is configuration and the token is the credential, but both are required before a request is made, and the error names whichever one is missing. The token needs `Account > Workers AI > Read`.
+
+```bash
+export CLOUDFLARE_ACCOUNT_ID="your Cloudflare account id"
+export CLOUDFLARE_API_TOKEN="a Cloudflare API token with Account > Workers AI > Read"
+```
+
+Set them in the Home Assistant environment, for example through the container's environment settings or the `homeassistant` service unit, then restart Home Assistant. The form deliberately does not ask for them, because a config entry is stored on disk in plain text.
+
+Clef ships two checkpoints of the one model, `clef` and `clef-flash`, selected with the `clef_model` field. The checkpoint changes the model and the endpoint, never the shape of the answer, so `clef-flash` is not a separate provider and cannot be selected as one.
+
+## Has the Clef route been run against the real API?
+
+No. No Cloudflare credential authorized for Workers AI was available when this was written: every candidate token was refused with HTTP 401. The Clef route is covered by unit tests with an injected transport, and its request shape, response envelopes, error codes, and question-id rules come from Cloudflare's published documentation rather than from an observed reply. Run one review before you rely on it, and read that first review as a smoke test rather than as evidence that Clef agrees with hosted Jev.
+
+## What happens if Clef rejects a request?
+
+A Cloudflare error envelope with `success: false` raises with Cloudflare's own error code in the message, so a rate limit or a model quota problem is distinguishable from a malformed answer. An HTTP error keeps its status, which is what lets `clef_with_jev_fallback` fall through to hosted Jev on a refusal, an outage, or a rate limit. An answer carrying a choice this integration never offered, or a confidence index outside the answer's own legend scale, is refused before it becomes a decision event. Only the exception class name is logged: not the case, not the entity state, not the account id, not the token.
 
 ## How good is the local classifier?
 
@@ -51,7 +72,7 @@ Measured, not assumed. On the DOGA fork's 100-question, three-mode benchmark aga
 
 ## Where does the API key go?
 
-Enter it in the config flow when you select the OpenRouter route. Home Assistant stores it in the config entry. Do not place it in YAML or source control. There is no key to store on the Laya route. Case fields whose keys contain `token`, `password`, `secret`, `api_key`, or `credential` are redacted before provider submission, and the same redaction runs again before the decision event is fired.
+Enter it in the config flow when you select the OpenRouter route. Home Assistant stores it in the config entry. Do not place it in YAML or source control. There is no key to store on the Laya route, and the Clef routes keep nothing in the config entry at all: their token and account id come from `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in the environment, and the stored OpenRouter key is never forwarded to Clef. Case fields whose keys contain `token`, `password`, `secret`, `api_key`, or `credential` are redacted before provider submission, and the same redaction runs again before the decision event is fired.
 
 ## Does the integration support automations?
 
@@ -59,7 +80,7 @@ Yes. Automations can call `review` and `verify`, then respond to `jev_sentinel_d
 
 ## Is there a local-only decision mode?
 
-Yes, since v1.1.0. Select `laya` in the config flow, or its arrangement name `laya_local`, and run `laya-serve` on the same machine. The local route needs no API key and sends no request off the host, and it replaces the hosted route rather than extending it. The local policy and verification functions already ran without a provider request before that.
+Yes, since v1.1.0. Select `laya` in the config flow, or its arrangement name `laya_local`, and run `laya-serve` on the same machine. The local route needs no API key and sends no request off the host, and it replaces the hosted routes rather than extending them. The local policy and verification functions already ran without a provider request before that.
 
 ```bash
 python -m pip install laya
@@ -70,7 +91,7 @@ Then set `provider: laya` with `laya_base_url: http://127.0.0.1:8000`. The first
 
 ## Is there a fallback route that uses the local server first?
 
-Yes, since v1.2.0. Select `laya_with_jev_fallback`, or its canonical alias `laya_then_hosted`, and supply the hosted key. A review asks the local server first and, only when that attempt fails, sends the same redacted case to the hosted provider. The route is an explicit opt-in: the hosted route and the `laya` route behave exactly as they did before, an existing config entry without a `provider` field keeps the hosted route, and no other route reaches the local server. A hosted hop is tried only on a transport error, a timeout, or an HTTP 401, 403, 429, or 5xx from the local server; any other reply propagates unchanged. Without a hosted key the route fails fast with `missing OPENROUTER_API_KEY for the laya_then_hosted route`.
+Yes, since v1.2.0. Select `laya_with_jev_fallback`, or its canonical alias `laya_then_hosted`, and supply the hosted key. A review asks the local server first and, only when that attempt fails, sends the same redacted case to the hosted provider. The route is an explicit opt-in: the hosted route and the `laya` route behave exactly as they did before, an existing config entry without a `provider` field keeps the hosted route, and no other route reaches the local server. The second chain, `clef_with_jev_fallback` since v1.3.0, works the same way with Clef in place of the local server: Clef first, hosted Jev behind it, and a fallback hop only on a transport error, a timeout, or an HTTP 401, 403, 429, or 5xx. The local failure breaker guards the local hop only, so a Clef-first chain falls through on every qualifying failure rather than after three. A hosted hop is tried only on a transport error, a timeout, or an HTTP 401, 403, 429, or 5xx from the local server; any other reply propagates unchanged. Without a hosted key the route fails fast with `missing OPENROUTER_API_KEY for the laya_then_hosted route`.
 
 ### What if the local server stays down?
 
@@ -78,7 +99,7 @@ The route counts consecutive local failures. The first three each fall through t
 
 ### What happens to my case data on that route?
 
-On the chained route, a failed local attempt sends the redacted case to a hosted API. Redaction runs before the first attempt, so both hops receive the same redacted case and credential-shaped fields never leave the machine. The rest of the case does leave the machine whenever the local server fails. If a case must never leave the machine, use the `laya` route alone, which has no fallback.
+On a chained route, a failed first attempt sends the redacted case to a hosted API. Redaction runs before the first attempt, so every hop receives the same redacted case and credential-shaped fields never leave the machine. The rest of the case does leave the machine whenever the first provider fails. On the Clef routes the redacted case leaves the machine on every call, not only on a failure, because Clef is hosted. If a case must never leave the machine, use the `laya` route alone, which has no fallback.
 
 ## How much should I trust the reported confidence?
 
@@ -102,7 +123,7 @@ No. Do not use it as certified safety equipment, alarm control, emergency automa
 
 ## How can I debug a provider failure?
 
-Check the config entry, the configured route, key availability, network access to `https://openrouter.ai/api/alpha/decisions`, and the returned provider shape. The runtime expects an `answers` object with `outcome`, `action`, and `confidence`. No decision event is evidence of a completed review.
+Check the config entry, the configured route, key availability, network access to `https://openrouter.ai/api/alpha/decisions`, and, on a Clef route, that both `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are set in the Home Assistant environment. Then check the returned provider shape. The runtime expects an `answers` object with `outcome`, `action`, and `confidence`. No decision event is evidence of a completed review.
 
 On the Laya route, check that `laya-serve` is running and that `laya_base_url` matches the port you bound it to. A connection refused means the server is not up or is on another port. An HTTP 422 carrying `a score question takes 'criteria' as a list of level descriptions` means the server rejected the rubric, which should not happen on v1.1.0 or later. An HTTP 404 with `{"detail":"Not Found"}` means something other than Laya answered on that port.
 

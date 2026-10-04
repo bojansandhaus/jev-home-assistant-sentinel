@@ -6,8 +6,8 @@
 - [ ] No provider key, personal entity name, private path, or raw household history is present.
 - [ ] Shadow mode remains the default.
 - [ ] Every execution example includes deterministic readback.
-- [ ] Both provider routes are documented as alternatives: hosted Jev over an API key, or Laya locally with no key.
-- [ ] The third route, `laya_then_hosted`, is documented as an explicit opt-in, and the existing hosted and local routes are re-checked as unchanged.
+- [ ] The single-provider routes are documented as alternatives: hosted Jev over an API key, Cloudflare Clef over the environment, or Laya locally with no key.
+- [ ] Both opt-in chains, `laya_then_hosted` and `clef_then_jev`, are documented as explicit opt-ins, and the pre-existing hosted and local routes are re-checked as unchanged.
 - [ ] The privacy consequence of the chained route is stated plainly wherever the route is documented: a failed local attempt sends the redacted case to a hosted API, and redaction runs before the first attempt.
 - [ ] The score rubric is an ordered list of levels in every copy of it, and the confidence mapping is stated with its resolution.
 - [ ] The local route was exercised against a real `laya-serve`, not a mock, and the observed outcome, action, and confidence are recorded in the release notes.
@@ -15,7 +15,10 @@
 - [ ] GitHub metadata and CI are read back after publication.
 - [ ] The local failure breaker is re-checked: three consecutive local failures fall back, the fourth is suppressed with no hosted call and the local error re-raised, a healthy local call resets the counter, and the counter is documented as per process and per copy, cleared by a restart.
 - [ ] Every log call on the decision path was audited, file by file, and none can carry a case, entity state, or an answer. Only an exception class name is logged.
-- [ ] The three named arrangements, `jev_api`, `laya_local`, and `laya_with_jev_fallback`, are offered in the config flow and exported from the package API, and the canonical route aliases resolve identically to them.
+- [ ] The five named arrangements, `jev_api`, `clef_api`, `laya_local`, `laya_with_jev_fallback`, and `clef_with_jev_fallback`, are offered in the config flow and exported from the package API, and the canonical route aliases resolve identically to them.
+- [ ] The Clef checkpoint is offered as a field of the route, not as a provider name, and `clef-flash` cannot be selected as a route.
+- [ ] Every environment variable a route reads is documented, and no credential is written to a config entry, a file, a log, or a release note.
+- [ ] Any route without a live verified call is reported as unit-test coverage only, with the reason stated plainly.
 - [ ] The DOGA 100-question benchmark numbers are cited as the headline quality evidence wherever local classifier quality is discussed, together with the limit that the breaker cannot detect a valid yet incorrect local judgment.
 - [ ] The note that the hosted endpoint's acceptance of the five-level confidence rubric is unverified is still carried.
 - [ ] No documentation writes the banned two-word phrase for the local classifier; the local model is described as Laya, and the hosted model as Jev.
