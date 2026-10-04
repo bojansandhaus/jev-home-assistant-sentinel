@@ -98,14 +98,38 @@ OFF_RUBRIC_BODY = {
 }
 
 
+class _StubResponse:
+    """Stands in for the object `urlopen(...)` yields inside a `with` block."""
+
+    def __init__(self, body):
+        self._payload = json.dumps(body).encode()
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class _StubTransport:
-    """Returns one fixed body in place of the network."""
+    """Returns one fixed body in place of the network.
+
+    It is a context manager because every provider does
+    `with urlopen(request, ...) as response:`. An earlier version of this test
+    returned the dict directly, so the providers raised
+    `AttributeError('__enter__')` before reaching any validation. The test then
+    passed on 3.11 while asserting on an unrelated exception's message, and
+    failed on 3.10. It was not testing the rubric at all.
+    """
 
     def __init__(self, body):
         self.body = body
 
     def __call__(self, *args, **kwargs):
-        return self.body
+        return _StubResponse(self.body)
 
 
 @pytest.fixture(autouse=True)
@@ -128,21 +152,38 @@ def test_off_rubric_answer_is_refused_on_the_package_jev_route(monkeypatch):
     monkeypatch.setattr(pkg, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
     with pytest.raises(Exception) as exc:
         provider.decide({})
-    assert "unknown choice" in str(exc.value).lower() or "not" in str(exc.value).lower()
+    # The refusal must name the offending choice, not merely be an exception.
+    # `pytest.raises(Exception)` also catches AttributeError and friends, so
+    # assert the message carries the actual reason.
+    # The validator names the offending question, not the rejected choice, so
+    # assert on that. The AttributeError guard is what caught the earlier stub
+    # that never reached validation at all.
+    assert "unknown choice for 'outcome'" in str(exc.value), str(exc.value)
+    assert "AttributeError" not in str(exc.value), "stub did not reach the validator"
 
 
 def test_off_rubric_answer_is_refused_on_the_runtime_jev_route(monkeypatch):
     provider = runtime.OpenRouterJev("key")
     monkeypatch.setattr(runtime, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as exc:
         provider.decide({})
+    # The validator names the offending question, not the rejected choice, so
+    # assert on that. The AttributeError guard is what caught the earlier stub
+    # that never reached validation at all.
+    assert "unknown choice for 'outcome'" in str(exc.value), str(exc.value)
+    assert "AttributeError" not in str(exc.value), "stub did not reach the validator"
 
 
 def test_off_rubric_answer_is_refused_on_the_package_laya_route(monkeypatch):
     provider = pkg.LayaJev("http://127.0.0.1:8123/v1/systemone")
     monkeypatch.setattr(pkg, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
-    with pytest.raises(Exception):
+    with pytest.raises(Exception) as exc:
         provider.decide({})
+    # The validator names the offending question, not the rejected choice, so
+    # assert on that. The AttributeError guard is what caught the earlier stub
+    # that never reached validation at all.
+    assert "unknown choice for 'outcome'" in str(exc.value), str(exc.value)
+    assert "AttributeError" not in str(exc.value), "stub did not reach the validator"
 
 
 def test_off_rubric_answer_is_refused_on_the_runtime_laya_route(monkeypatch):
