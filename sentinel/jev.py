@@ -396,6 +396,7 @@ class OpenRouterJev:
         )
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
+        validate_answers(body.get("answers", {}), decision_questions(), label=MODEL)
         return decision_from_body(body, model=MODEL)
 
 
@@ -772,6 +773,13 @@ class LayaJev:
         )
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
+        # Same rubric check the hosted route uses. Without it an off-rubric or
+        # malformed answer is accepted at whatever confidence it claims, and
+        # `confidence_from_score` silently clamps an out-of-range score instead
+        # of refusing it.
+        validate_answers(
+            body.get("answers", {}), decision_questions(), label=self.model
+        )
         decision = decision_from_body(body, model=self.model)
         # A successful local call clears the consecutive-failure count, on the
         # local-only route and on the local hop of the chained route alike.

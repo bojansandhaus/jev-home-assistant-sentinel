@@ -1,5 +1,22 @@
 # Release notes
 
+## v1.4.1 (2026-10-05)
+
+Two safety defects, found by independent review and pinned by a new 41-test
+suite that fails against v1.4.0. Full detail in `CHANGELOG.md`.
+
+- **Credential redaction missed three spellings.** `api-key`, `apiKey`, `api key`
+  and `Authorization` were not redacted while `api_key` was, so a secret stored
+  under one of those names was sent to the provider in cleartext. Both copies of
+  the rule now normalise case and separators first and share one implementation.
+- **The rubric boundary only existed on the Clef route.** The Jev and Laya routes
+  accepted an off-rubric answer at whatever confidence it claimed, and silently
+  clamped an out-of-range score instead of refusing it. Every route validates now.
+- Two further defects are recorded in the changelog as deliberately NOT fixed here,
+  because each needs a behaviour decision and its own tests: the local-failure
+  breaker is a process global with no cooldown, and `auto` silently acquires a
+  local hop from the config form's default.
+
 ## v1.4.0
 
 Replaces the five route names with **four decision modes** and turns the local provider into a **generic local decision-model slot**. Every name this repository shipped before still works, so a configuration that worked before this change produces the same routing decision after it.

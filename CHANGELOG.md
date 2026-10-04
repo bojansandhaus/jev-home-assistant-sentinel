@@ -211,3 +211,45 @@ because its absence means `laya`.
 
 - This release runs in shadow mode only. The Home Assistant integration does not dispatch an
   action after a recommendation.
+
+## 1.4.1 - 2026-10-05
+
+Two safety defects found by independent review, plus a cross-copy drift that had
+allowed them. `tests/test_safety_boundaries.py` (41 tests) fails against v1.4.0.
+
+### Fixed
+
+- **Credential redaction missed three spellings in the Home Assistant copy.**
+  `runtime.redact()` matched a literal substring list against a lowercased key, so
+  `api_key` was redacted while `api-key`, `apiKey`, `api key` and `Authorization`
+  were not. A secret stored under one of those names was sent to the provider in
+  cleartext, because that redacted payload is what goes on the wire. Both copies
+  now normalise case and separators before matching, and both use the same rule,
+  so they can no longer diverge.
+- **The rubric boundary only existed on the Clef route.** `OpenRouterJev.decide`
+  and `LayaJev.decide` went straight from `json.loads` to `decision_from_body`
+  with no `validate_answers` call, in both the package and the runtime copy. An
+  off-rubric answer was accepted at whatever confidence it claimed:
+  `outcome: TOTALLY_MADE_UP_OUTCOME` with `action: cover.open_garage` became a
+  `Decision` at full confidence, and `confidence_from_score` silently clamped an
+  out-of-range 99 to 1.0 instead of refusing it. `docs/reference.md` already
+  promised answers are refused the same way whatever answered; now they are.
+  Every route validates.
+- **`Authorization` is now redacted as a key**, not only in text.
+
+### Changed
+
+- `runtime.redact()` imports the predicate from `sentinel.redaction` instead of
+  keeping a second, weaker copy of the rule.
+
+### Not changed, deliberately
+
+- The local-failure breaker is still a module global with no cooldown, so one
+  entry's dead local server can deny another entry its fallback until restart.
+  That is a real defect and the fix needs a decision about per-entry keying that
+  belongs in its own change with its own tests. It is recorded here rather than
+  silently patched.
+- `auto` mode still resolves to `api_with_local_fallback` when the config form
+  injects its `local_model` default, so a user who selected `auto` and touched
+  nothing gets a local hop they did not ask for. Same reasoning: a behaviour
+  change, not a typo, and it needs its own release note.

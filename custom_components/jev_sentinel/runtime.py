@@ -39,6 +39,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
+from sentinel.redaction import _key_is_secret
+
 logger = logging.getLogger(__name__)
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
@@ -597,6 +599,7 @@ class OpenRouterJev:
         )
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
+        validate_answers(body.get("answers", {}), decision_questions(), label=MODEL)
         return decision_from_body(body, model=MODEL)
 
 
@@ -947,6 +950,13 @@ class LayaJev:
         )
         with urlopen(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode())
+        # Same rubric check the hosted route uses. Without it an off-rubric or
+        # malformed answer is accepted at whatever confidence it claims, and
+        # `confidence_from_score` silently clamps an out-of-range score instead
+        # of refusing it.
+        validate_answers(
+            body.get("answers", {}), decision_questions(), label=self.model
+        )
         decision = decision_from_body(body, model=self.model)
         # A successful local call clears the consecutive-failure count, on the
         # local-only route and on the local hop of the chained route alike.
@@ -1382,14 +1392,7 @@ def redact(value: Any) -> Any:
         return _SECRET_TEXT.sub(r"\1\2[REDACTED]", value)
     if isinstance(value, dict):
         return {
-            str(key): (
-                "[REDACTED]"
-                if any(
-                    word in str(key).lower()
-                    for word in ("token", "password", "secret", "api_key", "credential")
-                )
-                else redact(item)
-            )
+            str(key): ("[REDACTED]" if _key_is_secret(key) else redact(item))
             for key, item in value.items()
         }
     if isinstance(value, list):

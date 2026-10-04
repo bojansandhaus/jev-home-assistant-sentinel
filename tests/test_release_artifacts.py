@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -12,9 +13,16 @@ def test_release_metadata_is_complete():
     pyproject = (ROOT / "pyproject.toml").read_text()
     # Home Assistant reads the manifest version and the package reads the
     # pyproject one, so a release that bumps only one of them ships two
-    # different versions. They are asserted equal here.
-    assert 'version = "1.4.0"' in pyproject
-    assert manifest["version"] == "1.4.0"
+    # different versions. The invariant is that they agree, not any particular
+    # number, so this parses both and compares them. It used to hardcode
+    # "1.4.0", which made every version bump a three-way edit across two files
+    # and a test, and had already been missed once.
+    pyproject_version = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+    assert pyproject_version, "pyproject.toml declares no version"
+    assert manifest["version"] == pyproject_version.group(1), (
+        f"manifest says {manifest['version']} and pyproject says "
+        f"{pyproject_version.group(1)}; a release must bump both together"
+    )
     assert hacs == {
         "name": "Jev Home Assistant Sentinel",
         "render_readme": True,
@@ -22,7 +30,6 @@ def test_release_metadata_is_complete():
         "content_in_root": False,
         "zip_release": False,
     }
-    assert manifest["version"] == "1.4.0"
     assert manifest["integration_type"] == "service"
     assert manifest["domain"] == "jev_sentinel"
 
