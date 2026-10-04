@@ -24,8 +24,7 @@ This integration can reach these members:
 | **Jev** | hosted, TypeSafe or OpenRouter | closed | `api_only`, or the hosted hop of either fallback mode |
 | **Clef** and **Clef Flash** | hosted, Cloudflare Workers AI | closed | `clef`, `clef_then_jev`, `clef_with_local_fallback`, with `clef_model` choosing the checkpoint |
 | **Laya** | local, on this machine | open | `local_only`, the local hop of either fallback mode, and the default for `local_model` |
-| **Kev** | wherever you host it | open, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases | `local_model: kev` in the local slot |
-| **Tev1** | wherever you host it | open, Together AI, Qwen3.5-based | `local_model: tev1` in the local slot |
+| **Laya or other pre-deterministic routing models** | wherever you host them | whatever that engine ships | `local_model` in the local slot, which takes any engine name |
 
 ## The four decision modes
 
@@ -40,7 +39,7 @@ Configuration exposes exactly four decision modes. Each names which side leads a
 
 The two `_only` modes are single-provider routes: no chain, no fallback, no cooldown list beyond the one provider. The two `_with_..._fallback` modes are two-provider chains and use the existing cooldown, trigger, and breaker machinery unchanged.
 
-**The local slot is generic.** The provider name in configuration stays `laya`, and a new **`local_model`** setting selects which local decision model answers. It defaults to `laya`. The value is the checkpoint or engine name sent to the local server, so a different local model is selected by **configuration alone, with no code change and no new provider name**, and it is deliberately not validated against a list of names. Pointing `laya_base_url` at another engine's server is also a configuration change. System One decision models known to fit the slot, because they publish the same `/v1/systemone` request shape: `laya` (also `laya-multilingual` and `laya-typed-decisions`), `kev` (open weights, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases, also published as `kev-0.8b`), `tev1` ([Together AI](https://github.com/togethercomputer/tev1), Qwen3.5-based, open weights; `Tev1-4B` and `Tev1-0.8B`), and `jeff-qwen3.5-0.8b` and `jeff-gemma4-e2b`. See [chaitin/Decis](https://github.com/chaitin/Decis), which serves Laya, Kev, and the jeff family behind one `/v1/systemone` endpoint, one Docker image per engine, and where swapping `base_url` is the whole migration.
+**The local slot is generic.** The provider name in configuration stays `laya`, and a new **`local_model`** setting selects which local decision model answers. It defaults to `laya`. The value is the checkpoint or engine name sent to the local server, so a different local model is selected by **configuration alone, with no code change and no new provider name**, and it is deliberately not validated against a list of names. Pointing `laya_base_url` at another engine's server is also a configuration change. System One decision models known to fit the slot, because they publish the same `/v1/systemone` request shape, are Laya and other pre-deterministic routing models: `laya` is the default and is also published as `laya-multilingual` and `laya-typed-decisions`, and any other local engine that answers the same shape is selected by naming it.
 
 **Which hosted model answers the API side** is still its own choice and is not renamed: hosted Jev over an OpenRouter API key, or [Cloudflare Clef](https://developers.cloudflare.com/workers-ai/models/clef/) over a Workers AI account and API token read from the environment. Both remain individually selectable and remain the members of the hosted fallback order.
 
@@ -210,7 +209,7 @@ case = Case.create(
 
 # One of the four modes.
 provider = build_provider("api_only", api_key=hosted_key)
-provider = build_provider("local_only", local_model="kev")
+provider = build_provider("local_only", local_model="your-local-engine")
 provider = build_provider("api_with_local_fallback", api_key=hosted_key)
 provider = build_provider("local_with_api_fallback", api_key=hosted_key)
 # Clef alone. Its token and account id come from CLOUDFLARE_API_TOKEN and
@@ -235,7 +234,7 @@ No. The Home Assistant review handler only emits a recommendation event. It does
 
 ### Can I use a different decision model than Jev?
 
-The integration ships four modes: `api_only`, `local_only`, `api_with_local_fallback`, and `local_with_api_fallback`. The local side is not bound to Laya: set `local_model` to `kev`, `tev1`, or a `jeff` checkpoint, or to any other System One decision model that publishes the same `/v1/systemone` request shape, and it works by configuration alone with no code change. Point `laya_base_url` at that engine's server. See [chaitin/Decis](https://github.com/chaitin/Decis) for one endpoint serving Laya, Kev, and the jeff family behind one Docker image per engine. The provider-neutral core also accepts another implementation of `DecisionProvider`.
+The integration ships four modes: `api_only`, `local_only`, `api_with_local_fallback`, and `local_with_api_fallback`. The local side is not bound to Laya: set `local_model` to **Laya or another pre-deterministic routing model** that publishes the same `/v1/systemone` request shape, and it works by configuration alone with no code change. Point `laya_base_url` at that engine's server. The provider-neutral core also accepts another implementation of `DecisionProvider`.
 
 ### What does the Cloudflare Clef route need?
 
@@ -280,12 +279,12 @@ python -m pip install laya
 LAYA_HOST=127.0.0.1 LAYA_PORT=8000 LAYA_MODELS=english laya-serve
 ```
 
-Home Assistant listens on 8123 itself, so bind the server to another port and set `laya_base_url` to match. To run a different engine instead, start that engine's server and set `local_model` to its engine or checkpoint name. For example, with a Decis image serving Kev:
+Home Assistant listens on 8123 itself, so bind the server to another port and set `laya_base_url` to match. To run a different engine instead, start that engine's server and set `local_model` to its engine or checkpoint name. For example, with an image serving another local System One decision model:
 
 ```yaml
 provider: local_only
 laya_base_url: http://127.0.0.1:8000
-local_model: kev
+local_model: your-local-engine
 ```
 
 No code change is needed, and `local_model` is not restricted to a list of names.
@@ -302,9 +301,9 @@ On a fallback mode, the redacted case goes to the other side when the first atte
 
 This repository carries the topic tags that name the same taxonomy as the table above, so the tags and these docs agree:
 
-`ai`, `clef`, `cloudflare`, `custom-integration`, `decision-model`, `hacs`, `hacs-integration`, `home-assistant`, `jev`, `kev`, `laya`, `openrouter`, `safety`, `sentinel`, `system-one`, `tev1`.
+`ai`, `clef`, `cloudflare`, `custom-integration`, `decision-model`, `hacs`, `hacs-integration`, `home-assistant`, `jev`, `laya`, `openrouter`, `safety`, `sentinel`, `system-one`.
 
-`system-one` and `decision-model` are the category, `jev`, `clef`, `kev`, `laya`, and `tev1` are members of it, and `cloudflare` and `openrouter` name where two of them are hosted.
+`system-one` and `decision-model` are the category, `jev`, `clef`, and `laya` are members of it, and `cloudflare` and `openrouter` name where two of them are hosted.
 
 ## Documentation and links
 
@@ -319,4 +318,4 @@ This repository carries the topic tags that name the same taxonomy as the table 
 - [What is a System One model](https://systemonemodels.org/guides/what-is-a-system-one-model/)
 - [System One ecosystem index](https://systemonemodels.org/)
 
-Other members catalogued in the same index: **CLM** and **GLiNER2.5-Decide** (open weights), plus hosted **d1** (Liquid AI), **Mercury Decide** (Inception, free on OpenRouter), **Solar Decide** (Upstage), **pplx-decider** (Perplexity), **Span-01** (Respan), **Decider 1** (meraGPT), and the **OpenAI Decisions API**.
+The ecosystem index at https://systemonemodels.org/ catalogues further members of the category, both open-weight and hosted. This repository names only the members its own adapters reach, which are Jev, Clef and Clef Flash, and Laya.

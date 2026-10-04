@@ -84,8 +84,8 @@ MODE_LABELS = {
 # a model name: empty, whitespace-only, or carrying a character that would
 # corrupt the JSON body or a URL path segment.
 LOCAL_MODEL_HELP = (
-    "laya, kev, tev1, jeff-qwen3.5-0.8b, or any other local System One decision"
-    " model that speaks the same /v1/systemone contract"
+    "laya, or the name of any other local System One decision model that"
+    " speaks the same /v1/systemone contract"
 )
 
 # The canonical route names, kept selectable so an existing entry and the two

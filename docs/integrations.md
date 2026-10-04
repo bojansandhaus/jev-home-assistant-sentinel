@@ -234,11 +234,9 @@ System One decision models known to fit the slot, because they publish the same 
 | `local_model` value | Model |
 |---|---|
 | `laya`, `laya-multilingual`, `laya-typed-decisions` | [Laya](https://github.com/NandhaKishorM/laya) (Convai Innovations, local, open weights) |
-| `kev`, `kev-0.8b` | Kev, open weights, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases, serving the same `/v1/systemone` shape as TypeSafe's API |
-| `tev1`, `Tev1-4B`, `Tev1-0.8B` | [Tev1](https://github.com/togethercomputer/tev1) (Together AI, Qwen3.5-based, open weights) |
-| `jeff-qwen3.5-0.8b`, `jeff-gemma4-e2b` | The jeff family |
+| your own engine or checkpoint name | Laya or other pre-deterministic routing models: any local engine publishing the same `POST /v1/systemone` request shape and answering in the same `answers` shape |
 
-[chaitin/Decis](https://github.com/chaitin/Decis) is the reference for the interchangeable-engine claim: it serves Laya, Kev, and the jeff family behind one `/v1/systemone` endpoint, with one Docker image per engine, and swapping `base_url` is the whole migration.
+[chaitin/Decis](https://github.com/chaitin/Decis) is the reference for the interchangeable-engine claim: it serves several such engines behind one `/v1/systemone` endpoint, with one Docker image per engine, and swapping `base_url` is the whole migration.
 
 A worked example, one Decis image per engine on loopback:
 
@@ -250,7 +248,7 @@ docker run --rm -p 127.0.0.1:8000:8000 ghcr.io/chaitin/decis:laya
 ```yaml
 provider: local_only
 laya_base_url: http://127.0.0.1:8000
-local_model: laya        # or kev, tev1, Tev1-0.8B, jeff-qwen3.5-0.8b, ...
+local_model: laya        # or any other local engine or checkpoint name
 ```
 
 Swap the image and change one line:
@@ -258,7 +256,7 @@ Swap the image and change one line:
 ```yaml
 provider: local_only
 laya_base_url: http://127.0.0.1:8000
-local_model: kev
+local_model: your-local-engine
 ```
 
 Two boundaries on this claim, stated plainly:
@@ -312,7 +310,7 @@ provider = build_provider("local_with_api_fallback", api_key=hosted_key)
 provider = build_provider("laya_with_jev_fallback", api_key=hosted_key)
 # The local model is configuration, not a new provider.
 provider = build_provider("local_with_api_fallback", api_key=hosted_key,
-                          local_model="kev")
+                          local_model="your-local-engine")
 decision = SentinelWorkflow(provider).review(case)
 print(decision.raw["provider"], decision.raw["attempted"])
 ```

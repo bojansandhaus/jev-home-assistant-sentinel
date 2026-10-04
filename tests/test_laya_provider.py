@@ -199,7 +199,7 @@ def test_a_local_member_is_rejected_in_the_hosted_fallback_order():
         provider_order("laya", fallback_order=("openrouter", "laya"))
     # ``laya`` is a legacy alias of ``local_only``, not an unknown name. A value
     # that is neither a mode, an alias, nor a hosted provider is still refused.
-    for name in ("local", "Laya", "typesafe", "kev"):
+    for name in ("local", "Laya", "typesafe", "your-local-engine"):
         with pytest.raises(ValueError, match="invalid provider"):
             provider_order(name)
 
@@ -947,7 +947,7 @@ def test_every_legacy_name_still_resolves_to_the_same_routing():
     # it is checked above rather than listed here. The names the earlier releases
     # rejected are still rejected, and the error now names every accepted mode
     # and alias rather than hiding them.
-    for unknown in ("Laya", "typesafe", "laya_then_hosted_now", "kev"):
+    for unknown in ("Laya", "typesafe", "laya_then_hosted_now", "your-local-engine"):
         assert resolve_provider(unknown) == unknown
         with pytest.raises(ValueError, match="invalid provider"):
             provider_order(unknown)
@@ -986,19 +986,19 @@ def test_auto_resolves_by_whether_a_local_model_is_configured():
     assert local_model_configured(None) is False
     # Naming a local model is what puts the local slot behind the API, which is
     # what ``api_with_local_fallback`` means.
-    assert resolve_auto_mode(local_model="kev") == API_WITH_LOCAL_FALLBACK
-    assert local_model_configured("kev") is True
+    assert resolve_auto_mode(local_model="your-local-engine") == API_WITH_LOCAL_FALLBACK
+    assert local_model_configured("your-local-engine") is True
     assert provider_order(
-        "auto", env={"OPENROUTER_API_KEY": "private"}, local_model="kev"
+        "auto", env={"OPENROUTER_API_KEY": "private"}, local_model="your-local-engine"
     ) == ["openrouter", LOCAL_PROVIDER]
     # A local model with no hosted provider at all is still nothing configured.
     # ``auto`` selects among the hosted providers, and naming a local model does
     # not by itself make a hosted-first mode usable, so this preserves what
     # ``auto`` meant before v1.4.0 rather than silently answering from the local
     # slot under a hosted-first mode's name.
-    assert provider_order("auto", env={}, local_model="kev") == []
+    assert provider_order("auto", env={}, local_model="your-local-engine") == []
     with pytest.raises(RuntimeError, match="no Jev provider is configured"):
-        build_provider("auto", env={}, local_model="kev")
+        build_provider("auto", env={}, local_model="your-local-engine")
 
 
 @pytest.mark.parametrize(
@@ -1073,13 +1073,13 @@ def test_local_model_selects_the_engine_and_the_default_is_unchanged():
     # A different engine is configuration, not a new provider, and not an
     # allowlist: a model published after this release works by naming it.
     for engine in (
-        "kev",
-        "kev-0.8b",
-        "tev1",
-        "Tev1-4B",
-        "Tev1-0.8B",
-        "jeff-qwen3.5-0.8b",
-        "jeff-gemma4-e2b",
+        "your-local-engine",
+        "your-local-engine-0.8b",
+        "another-local-engine",
+        "Another-Engine-4B",
+        "Another-Engine-0.8B",
+        "pre-routed-qwen3.5-0.8b",
+        "pre-routed-gemma4-e2b",
         "laya-multilingual",
         "laya-typed-decisions",
         "some-model-published-next-year",
@@ -1096,8 +1096,8 @@ def test_local_model_changes_what_the_local_request_asks_for(monkeypatch):
     monkeypatch.delenv("LAYA_API_KEY", raising=False)
     for engine, expected in (
         (None, LAYA_MODEL),
-        ("kev", "kev"),
-        ("tev1", "tev1"),
+        ("your-local-engine", "your-local-engine"),
+        ("another-local-engine", "another-local-engine"),
     ):
         seen = _capture(monkeypatch, sys.modules["sentinel.jev"], _answered(engine))
         provider = build_provider(
@@ -1117,9 +1117,9 @@ def test_local_model_takes_precedence_over_the_deprecated_laya_model(monkeypatch
     # in docs/reference.md.
     assert (
         build_provider(
-            LOCAL_ONLY, env={}, local_model="kev", laya_model="english"
+            LOCAL_ONLY, env={}, local_model="your-local-engine", laya_model="english"
         ).model
-        == "kev"
+        == "your-local-engine"
     )
     # It is a local setting, so it never changes which provider answers.
     assert provider_order(LOCAL_ONLY, env={}) == [LOCAL_PROVIDER]
@@ -1128,15 +1128,21 @@ def test_local_model_takes_precedence_over_the_deprecated_laya_model(monkeypatch
 def test_the_local_model_reaches_the_chain_and_the_entry_builder(monkeypatch):
     monkeypatch.delenv("LAYA_API_KEY", raising=False)
     chain = build_provider(
-        LOCAL_WITH_API_FALLBACK, api_key="private", env={}, local_model="tev1"
+        LOCAL_WITH_API_FALLBACK,
+        api_key="private",
+        env={},
+        local_model="another-local-engine",
     )
     assert chain.names == (LOCAL_PROVIDER, "openrouter")
-    assert chain.providers[0][1].model == "tev1"
+    assert chain.providers[0][1].model == "another-local-engine"
     hosted_first = build_provider(
-        API_WITH_LOCAL_FALLBACK, api_key="private", env={}, local_model="tev1"
+        API_WITH_LOCAL_FALLBACK,
+        api_key="private",
+        env={},
+        local_model="another-local-engine",
     )
     assert hosted_first.names == ("openrouter", LOCAL_PROVIDER)
-    assert hosted_first.providers[1][1].model == "tev1"
+    assert hosted_first.providers[1][1].model == "another-local-engine"
 
 
 @pytest.mark.parametrize(
@@ -1173,7 +1179,10 @@ def test_an_unusable_local_model_is_refused(bad):
         build_provider(LOCAL_ONLY, env={}, local_model=bad)
 
 
-@pytest.mark.parametrize("bad", [123, 4.5, True, ["kev"], {"model": "kev"}, object()])
+@pytest.mark.parametrize(
+    "bad",
+    [123, 4.5, True, ["your-local-engine"], {"model": "your-local-engine"}, object()],
+)
 def test_a_non_text_local_model_is_refused(bad):
     with pytest.raises(ValueError, match="invalid local_model"):
         local_checkpoint(bad)
@@ -1194,8 +1203,8 @@ def test_a_value_needing_url_escaping_is_refused_deliberately():
     for accepted in (
         "convaiinnovations/laya",
         "laya-typed-decisions",
-        "jeff-gemma4-e2b",
-        "Tev1-0.8B",
+        "pre-routed-gemma4-e2b",
+        "Another-Engine-0.8B",
         "model_1.2",
     ):
         assert local_checkpoint(accepted) == accepted
@@ -1204,11 +1213,11 @@ def test_a_value_needing_url_escaping_is_refused_deliberately():
 def test_local_model_never_becomes_a_mode_alias_or_a_fallback_member():
     # A model name is not a route, so it is refused by the mode resolver and it
     # cannot be appended to a hosted order as a last resort.
-    for engine in ("kev", "tev1", "laya-multilingual"):
+    for engine in ("your-local-engine", "another-local-engine", "laya-multilingual"):
         assert resolve_provider(engine) == engine
         with pytest.raises(ValueError, match="invalid provider"):
             provider_order(engine)
-    for engine in ("kev", "tev1"):
+    for engine in ("your-local-engine", "another-local-engine"):
         with pytest.raises(ValueError, match="invalid fallback_order"):
             validate_fallback_order(("openrouter", engine))
         with pytest.raises(ValueError, match="invalid fallback_order"):
@@ -1365,7 +1374,10 @@ def test_the_hosted_first_chain_calls_the_api_and_falls_through_to_local(monkeyp
     package = sys.modules["sentinel.jev"]
     hosted = "https://openrouter.ai/api/alpha/decisions"
     provider = build_provider(
-        API_WITH_LOCAL_FALLBACK, api_key="private", env={}, local_model="kev"
+        API_WITH_LOCAL_FALLBACK,
+        api_key="private",
+        env={},
+        local_model="your-local-engine",
     )
     assert isinstance(provider, ChainedJev)
     assert provider.names == ("openrouter", LOCAL_PROVIDER)
@@ -1382,7 +1394,7 @@ def test_the_hosted_first_chain_calls_the_api_and_falls_through_to_local(monkeyp
     def _api_refuses_then_local_answers(request):
         if request.full_url == hosted:
             raise _http_error(503)
-        assert json.loads(request.data.decode())["model"] == "kev"
+        assert json.loads(request.data.decode())["model"] == "your-local-engine"
         return _Response(_answered())
 
     transport = _RecordingTransport(_api_refuses_then_local_answers)
@@ -1447,7 +1459,9 @@ def test_only_the_documented_triggers_fall_through_on_both_chains(monkeypatch):
 
         transport = _RecordingTransport(_first_fails)
         monkeypatch.setattr(package, "urlopen", transport)
-        provider = build_provider(mode, api_key="private", env={}, local_model="kev")
+        provider = build_provider(
+            mode, api_key="private", env={}, local_model="your-local-engine"
+        )
         with pytest.raises(HTTPError):
             provider.decide({})
         assert transport.attempts == [first], mode
@@ -1467,7 +1481,12 @@ def test_the_four_modes_agree_between_the_package_and_the_runtime_bridge():
                 _runtime, mode, env
             ), (mode, env)
     # Both copies refuse the same names, with the same text.
-    for unknown in ("nonsense", "Laya", "kev", "local_with_api_fallback_now"):
+    for unknown in (
+        "nonsense",
+        "Laya",
+        "your-local-engine",
+        "local_with_api_fallback_now",
+    ):
         assert _order_or_error(package, unknown, both) == _order_or_error(
             _runtime, unknown, both
         ), unknown
@@ -1476,7 +1495,7 @@ def test_the_four_modes_agree_between_the_package_and_the_runtime_bridge():
         assert _runtime.resolve_provider(name) == package.resolve_provider(name), name
         assert _runtime.provider_mode(name) == package.provider_mode(name), name
     for env in ({}, dict(both), {"LAYA_API_KEY": "k"}):
-        for model in (None, "kev", "tev1"):
+        for model in (None, "your-local-engine", "another-local-engine"):
             assert _order_or_error(
                 package, API_WITH_LOCAL_FALLBACK, env, local_model=model
             ) == _order_or_error(

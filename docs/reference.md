@@ -6,15 +6,14 @@ This reference describes the public contracts implemented in `custom_components/
 
 A **System One decision model**, also written *typed decision model*, is a model that returns typed values, each carrying a probability, rather than prose. [TypeSafe coined the category alongside Jev on 15 September 2026](https://systemonemodels.org/guides/what-is-a-system-one-model/), and it is written System 1 as well. **Jev is one member of the category, not the name of it.**
 
-Other members catalogued in the same index: **CLM** and **GLiNER2.5-Decide** (open weights), plus hosted **d1** (Liquid AI), **Mercury Decide** (Inception, free on OpenRouter), **Solar Decide** (Upstage), **pplx-decider** (Perplexity), **Span-01** (Respan), **Decider 1** (meraGPT), and the **OpenAI Decisions API**.
+The ecosystem index at https://systemonemodels.org/ catalogues further members of the category, both open-weight and hosted. This reference names only the members this repository reaches.
 
 | Model | Where it runs | Weights | Adapter here |
 |---|---|---|---|
 | **Jev** | hosted, TypeSafe or OpenRouter | closed | `OpenRouterJev` |
 | **Clef** and **Clef Flash** | hosted, Cloudflare Workers AI | closed | `ClefJev`, checkpoint chosen by `clef_model` |
 | **Laya** | local, on this machine | open | `LayaJev`, the default for `local_model` |
-| **Kev** | wherever you host it | open, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases | the local slot, as `local_model: kev` |
-| **Tev1** | wherever you host it | open, Together AI, Qwen3.5-based | the local slot, as `local_model: tev1` |
+| **Laya or other pre-deterministic routing models** | wherever you host them | whatever that engine ships | the local slot, as any `local_model` value |
 
 ## Runtime boundaries
 
@@ -103,7 +102,7 @@ Every name this repository shipped before v1.4.0 keeps working, so no deployed c
 
 Three of these need explaining, because the four-mode vocabulary does not map cleanly onto everything this repository shipped:
 
-- **`auto` is dynamic.** It resolves to `api_with_local_fallback` when a `local_model` has been explicitly configured and to `api_only` otherwise, which is what it meant before v1.4.0: the hosted providers that are configured. It never selects the local slot on its own initiative, so `provider_order("auto", env={}, local_model="kev")` is still `[]`.
+- **`auto` is dynamic.** It resolves to `api_with_local_fallback` when a `local_model` has been explicitly configured and to `api_only` otherwise, which is what it meant before v1.4.0: the hosted providers that are configured. It never selects the local slot on its own initiative, so `provider_order("auto", env={}, local_model="your-local-engine")` is still `[]`.
 - **The hosted provider names resolve to `api_only`.** `openrouter`, `jev_api`, `clef`, and `clef_api` each named one hosted provider whose failure was reported and never rerouted, so each keeps meaning exactly that. A hosted provider reaches `api_with_local_fallback` only by naming the mode or the Clef-pinned alias.
 - **`clef_then_jev` is not one of the four modes.** Both of its hops are hosted, so it is a hosted-to-hosted chain rather than one side falling back to the other. It resolves to `local_with_api_fallback` so an entry storing it keeps routing the same way, and `pins_clef(stored_name)` preserves the Clef lead, because the canonical mode name alone cannot express which hosted provider leads. The Home Assistant entry module therefore reads the stored spelling before resolving it, and passes the stored name rather than the resolved mode to `build_provider`.
 
@@ -122,7 +121,7 @@ Both remain individually selectable and remain the members of `HOSTED_PROVIDERS`
 
 ### The local slot is a generic local decision-model slot
 
-The provider name in configuration stays `laya`. What changed in v1.4.0 is that it is no longer a hard-coded binding to one model: the new `local_model` setting selects which local decision model answers, it defaults to `laya`, and its value is the checkpoint or engine name sent to the local server.
+The provider name in configuration stays `laya`. What changed in v1.4.0 is that it is no longer a hard-coded binding to one model: the new `local_model` setting selects which local decision model answers, it defaults to `laya`, and its value is the checkpoint or engine name sent to the local server. The local routes are **Laya or other pre-deterministic routing models**: Laya is the default, and any other engine publishing the same request shape is selected by naming it.
 
 `local_checkpoint(model)` resolves the value:
 
@@ -130,11 +129,11 @@ The provider name in configuration stays `laya`. What changed in v1.4.0 is that 
 - Any other name is accepted. There is deliberately **no allowlist of model names**, because the point is interchangeability: a local model published after this release must work by configuration alone, with no code change and no new provider name.
 - A value that cannot be a name at all is refused with `ValueError("invalid local_model: ...")`: an empty or whitespace-only value, a value that is not text, and a value carrying a control character, a quote, a backslash, whitespace, or the URL delimiters `?`, `#`, and `&`, any of which would corrupt the JSON body or a URL path segment.
 
-Known to fit the slot, because they publish the same `/v1/systemone` request shape: `laya` (also `laya-multilingual` and `laya-typed-decisions`), `kev` (open weights, 0.8B to 27B on Qwen3.5 and Qwen3.8 bases, also published as `kev-0.8b`), `tev1` ([Together AI](https://github.com/togethercomputer/tev1), Qwen3.5-based, open weights; `Tev1-4B` and `Tev1-0.8B`), and `jeff-qwen3.5-0.8b` and `jeff-gemma4-e2b`. The reference for the interchangeable-engine claim is [chaitin/Decis](https://github.com/chaitin/Decis), which serves Laya, Kev, and the jeff family behind one `/v1/systemone` endpoint with one Docker image per engine, where swapping `base_url` is the whole migration.
+Known to fit the slot, because they publish the same `/v1/systemone` request shape: `laya` (also `laya-multilingual` and `laya-typed-decisions`), and any other local pre-deterministic routing model serving that endpoint. Swapping `base_url` at the engine's own server is the whole migration, so a different engine costs two configuration values and no code change.
 
 The local server URL remains its own setting, `laya_base_url`, so pointing the slot at a different engine is a configuration change. See [the integration guide](integrations.md#pointing-the-local-slot-at-a-different-engine).
 
-`local_model` never appears in a fallback order and is never a mode alias: `validate_fallback_order(("kev",))` raises `ValueError("invalid fallback_order")` and `provider_order("kev")` raises `ValueError("invalid provider: ...")`.
+`local_model` never appears in a fallback order and is never a mode alias: `validate_fallback_order(("your-local-engine",))` raises `ValueError("invalid fallback_order")` and `provider_order("your-local-engine")` raises `ValueError("invalid provider: ...")`.
 
 ### `laya_model` and `local_model`
 
@@ -155,7 +154,7 @@ The pre-existing `laya_model` setting is kept for backwards compatibility and is
 | `"clef_with_jev_fallback"` | `["clef", "openrouter"]` | Raises when Clef is not configured, and raises `ValueError("no configured hosted provider behind Clef for the clef_then_jev route")` when nothing is configured behind it. |
 | `"auto"` (default) | the configured members of `fallback_order`, `[]` without | Never selects the local route on its own initiative. `DEFAULT_FALLBACK_ORDER` is `("openrouter",)`. |
 
-`validate_fallback_order(order)` accepts a non-empty, duplicate-free order drawn from the hosted names only, which are `("openrouter", "clef")`. `("openrouter", "laya")` and `("laya",)` both raise `ValueError("invalid fallback_order")`, so the local slot cannot be added to the hosted order as a last resort. A mode name is rejected there too: `("local_with_api_fallback",)` raises the same error, because a chain is not a member of a chain, and so does a `local_model` value such as `("kev",)`, so a model name can never become a hosted member. `provider_order` raises `ValueError("invalid provider: ...")` for any name outside the [alias table](#the-alias-table), which here includes `typesafe`, `clef-flash`, `Laya`, and `kev`.
+`validate_fallback_order(order)` accepts a non-empty, duplicate-free order drawn from the hosted names only, which are `("openrouter", "clef")`. `("openrouter", "laya")` and `("laya",)` both raise `ValueError("invalid fallback_order")`, so the local slot cannot be added to the hosted order as a last resort. A mode name is rejected there too: `("local_with_api_fallback",)` raises the same error, because a chain is not a member of a chain, and so does a `local_model` value such as `("your-local-engine",)`, so a model name can never become a hosted member. `provider_order` raises `ValueError("invalid provider: ...")` for any name outside the [alias table](#the-alias-table), which here includes `typesafe`, `clef-flash`, `Laya`, and `your-local-engine`.
 
 `build_provider(...)` returns `LayaJev` for the local route, `OpenRouterJev` for the hosted Jev route, `ClefJev` for the Clef route, and `ChainedJev` for either chained route. It raises `RuntimeError("no Jev provider is configured...")` when `auto` resolves to no provider. An explicit `api_key` also satisfies the OpenRouter route check, so a caller holding its key in its own configuration does not need it in the environment. On a chained route that key belongs to the OpenRouter hops; the local hop keeps its own optional `LAYA_API_KEY`, and the Clef hop never receives it. On the local route, `api_key` is the optional bearer for a `laya-serve` started with its own check.
 
@@ -457,7 +456,7 @@ The config flow stores `provider`, and the fields for the selected route:
 | `clef_model` | no | `clef` | The Clef checkpoint: `clef` or `clef-flash`. Applies to the `clef` and `clef_then_jev` routes and is ignored on the others. An unknown value raises `ValueError("invalid Clef checkpoint: ...")`; a stored blank value falls back to the default. |
 | `api_key` | for `api_only`, `api_with_local_fallback`, and `local_with_api_fallback` | empty | The OpenRouter key. Selecting a mode that reaches hosted Jev with an empty key returns the `api_key_required` error. The check runs against the stored name, so `openrouter`, `jev_api`, `laya_then_hosted`, `laya_with_jev_fallback`, and `clef_with_jev_fallback` require a key, while `local_only`, `laya`, `laya_local`, and `clef_api` do not: Clef reads its own credential from the environment and never receives the stored OpenRouter key. |
 | `laya_base_url` | no | `http://127.0.0.1:8000` | The local decision-model server URL, used on `local_only` and on the local hop of both fallback modes. Pointing it at another engine's server is a configuration change, not a code change. |
-| `local_model` | no | `laya` | Which local System One decision model answers. Free text, not a list: any local model publishing the same `/v1/systemone` request shape fits, and a model published after this release works by naming it. Rejected only when empty, whitespace-only, not text, or carrying a character that would corrupt a URL path segment or a JSON string, with `ValueError("invalid local_model: ...")` at build time and the `local_model_invalid` error in the form. Known to fit: `laya`, `laya-multilingual`, `laya-typed-decisions`, `kev`, `kev-0.8b`, `tev1`, `Tev1-4B`, `Tev1-0.8B`, `jeff-qwen3.5-0.8b`, `jeff-gemma4-e2b`. **Takes precedence over `laya_model` when it is set.** |
+| `local_model` | no | `laya` | Which local System One decision model answers. Free text, not a list: any local model publishing the same `/v1/systemone` request shape fits, and a model published after this release works by naming it. Rejected only when empty, whitespace-only, not text, or carrying a character that would corrupt a URL path segment or a JSON string, with `ValueError("invalid local_model: ...")` at build time and the `local_model_invalid` error in the form. Known to fit: `laya`, `laya-multilingual`, `laya-typed-decisions`, and any other local pre-deterministic routing model serving that endpoint. **Takes precedence over `laya_model` when it is set.** |
 | `laya_model` | no | `convaiinnovations/laya` | **Deprecated.** The per-model setting kept for backwards compatibility. It is the older spelling of `local_model` and still works on its own, so an entry that stored only `laya_model` keeps calling that checkpoint. When both are present, `local_model` wins. |
 
 An existing config entry created before v1.1.0 has no `provider` field and keeps the hosted route, so no migration is required. An entry created before v1.3.0 has no `clef_model` field, which means the default checkpoint, so it needs none either. An entry created before v1.4.0 has no `local_model` field, which means `laya`, so it needs none either, and any `provider` value it stored still resolves to the same routing. The options flow accepts optional boolean `shadow`, default `true`. The Home Assistant adapter remains shadow-only regardless of that option.

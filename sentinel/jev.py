@@ -731,12 +731,12 @@ class LayaJev:
 
     The local slot is generic. It is not a hosted Jev endpoint, and it is not
     bound to one model either: it publishes ``POST /v1/systemone`` and answers
-    in the same ``answers`` shape, so Laya, Kev, Tev1, or a jeff checkpoint are
-    selected by the ``model`` argument, which is the value ``local_model``
-    supplies, rather than by a different provider name. The route is keyless: the
-    ``Authorization`` header is omitted entirely unless the server was started
-    with its own bearer check, because an empty header is not the same request
-    as no header.
+    in the same ``answers`` shape, so Laya or another pre-deterministic routing
+    model is selected by the ``model`` argument, which is the value
+    ``local_model`` supplies, rather than by a different provider name. The route
+    is keyless: the ``Authorization`` header is omitted entirely unless the
+    server was started with its own bearer check, because an empty header is not
+    the same request as no header.
     """
 
     def __init__(

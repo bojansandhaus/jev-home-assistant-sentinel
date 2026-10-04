@@ -28,7 +28,7 @@
 - [ ] No documentation writes the banned two-word phrase for the local classifier, and no document uses one vendor's member as the category name. The models are described as members of the System One decision model category, with Laya named as the local model and Jev as a hosted model.
 - [ ] The category term is introduced once per document on first mention, as "System One decision model" or "typed decision model", and is linked to https://systemonemodels.org/guides/what-is-a-system-one-model/ .
 
-Other members catalogued in the same index: **CLM** and **GLiNER2.5-Decide** (open weights), plus hosted **d1** (Liquid AI), **Mercury Decide** (Inception, free on OpenRouter), **Solar Decide** (Upstage), **pplx-decider** (Perplexity), **Span-01** (Respan), **Decider 1** (meraGPT), and the **OpenAI Decisions API**.
+The ecosystem index at https://systemonemodels.org/ catalogues further members of the category, both open-weight and hosted. This checklist names only the members this repository reaches.
 - [ ] The repository topic tags are listed in the README and match the remote topics, so tags and docs agree.
 - [ ] The honest limit is stated wherever the category is documented: membership and the shared wire contract are documented claims from those projects, not measurements made here, and no live call was made to any provider while this was written.
 - [ ] The user-facing strings name the category, and `strings.json` and `translations/en.json` remain byte-identical, with no field added or removed and no Cloudflare credential field in the form.

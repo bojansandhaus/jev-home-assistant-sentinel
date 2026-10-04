@@ -34,16 +34,16 @@ are in [docs/release-notes.md](docs/release-notes.md).
 - **`local_model` in the Home Assistant config flow**, as free text with its own
   translation label, validated before the entry is stored.
 - **The System One decision model category, named in the documentation.** The models this
-  integration reaches are described as members of one category rather than as "Jev-like":
-  Jev (hosted, TypeSafe or OpenRouter, closed weights), Clef and Clef Flash (hosted, Cloudflare
-  Workers AI), Laya (local, open weights, the `local_model` default), Kev (open weights, 0.8B to
-  27B on Qwen3.5 and Qwen3.8 bases, serving the same `/v1/systemone` request shape as TypeSafe's
-  ecosystem index at https://systemonemodels.org/. See
+  integration reaches are described as members of one category rather than by one vendor's
+  member: Jev (hosted, TypeSafe or OpenRouter, closed weights), Clef and Clef Flash (hosted,
+  Cloudflare Workers AI), and Laya (local, open weights, the `local_model` default), plus
+  whatever other local pre-deterministic routing model is configured. See the
+  [System One ecosystem index](https://systemonemodels.org/) and
   [what is a System One model](https://systemonemodels.org/guides/what-is-a-system-one-model/).
 
-Other members catalogued in the same index: **CLM** and **GLiNER2.5-Decide** (open weights), plus hosted **d1** (Liquid AI), **Mercury Decide** (Inception, free on OpenRouter), **Solar Decide** (Upstage), **pplx-decider** (Perplexity), **Span-01** (Respan), **Decider 1** (meraGPT), and the **OpenAI Decisions API**.
-  Jev is one member of the category, not the name of it, and the phrase naming one member as the
-  category is gone from the docs, from `strings.json`, and from both copies of the provider rules.
+  Jev is one member of the category, not the name of it, and the phrase naming one member as
+  the category is gone from the docs, from `strings.json`, and from both copies of the provider
+  rules.
 
 ### Changed
 
