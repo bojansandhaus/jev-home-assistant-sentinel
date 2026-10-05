@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -98,26 +99,54 @@ FALLBACK_STATUS_CODES = frozenset({401, 403, 429})
 
 # A repeated local outage must not quietly turn every household case into remote
 # traffic. Three consecutive local failures that qualified for the hosted
-# fallback still fall back; the fourth, and every one after it, is suppressed,
-# the local error is re-raised instead of being answered remotely, and a warning
-# is logged. The counter is per process and resets on restart, and any
-# successful local call resets it to zero.
+# fallback still fall back; the fourth, and every one after it, is suppressed and
+# the local error is re-raised instead of being answered remotely.
+#
+# The breaker is a process global, so two config entries share it: while the
+# household has two entries and only one local server is dead, the healthy entry
+# can be denied its fallback until the process restarts. It now decays. After
+# ``LOCAL_FALLBACK_COOLDOWN_SECONDS`` with no new failure the count returns to
+# zero, so a local server that comes back is retried instead of staying
+# suppressed for the life of the Home Assistant process.
+#
+# A successful local call also resets it immediately.
 LOCAL_FALLBACK_FAILURE_LIMIT = 3
+LOCAL_FALLBACK_COOLDOWN_SECONDS = 300.0
 _local_failure_lock = threading.Lock()
 _local_failure_count = 0
+_local_failure_last: float | None = None
 
 
 def local_failure_count() -> int:
-    """The consecutive local failures recorded in this process."""
+    """The consecutive local failures recorded in this process.
+
+    Returns zero once the cooldown has elapsed, so a caller reading the count
+    sees the same thing the breaker will act on.
+    """
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
+        _decay_locked()
         return _local_failure_count
+
+
+def _decay_locked() -> None:
+    """Reset the breaker if the cooldown has passed. Caller holds the lock."""
+    global _local_failure_count, _local_failure_last
+    if (
+        _local_failure_last is not None
+        and _local_failure_count
+        and time.monotonic() - _local_failure_last >= LOCAL_FALLBACK_COOLDOWN_SECONDS
+    ):
+        _local_failure_count = 0
+        _local_failure_last = None
 
 
 def reset_local_failures() -> None:
     """Clear the local failure counter after a successful local call."""
-    global _local_failure_count
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
         _local_failure_count = 0
+        _local_failure_last = None
 
 
 def note_local_failure(exc: BaseException) -> bool:
@@ -128,16 +157,41 @@ def note_local_failure(exc: BaseException) -> bool:
     below ``LOCAL_FALLBACK_FAILURE_LIMIT``, so the hosted fallback may be
     attempted. ``False`` means the breaker is tripped and the caller must
     re-raise the local error rather than answer it remotely.
+
+    The log line states which of those two happened. It used to say
+    "considering the hosted fallback" unconditionally, before the count was
+    compared against the limit, so a suppressed call logged that it was about to
+    fall back and then did not.
     """
-    global _local_failure_count
-    logger.warning(
-        "local %s decision failed (%s); considering the hosted fallback",
-        LOCAL_PROVIDER,
-        type(exc).__name__,
-    )
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
+        _decay_locked()
         _local_failure_count += 1
-        return _local_failure_count <= LOCAL_FALLBACK_FAILURE_LIMIT
+        _local_failure_last = time.monotonic()
+        count = _local_failure_count
+        may_fallback = count <= LOCAL_FALLBACK_FAILURE_LIMIT
+    if may_fallback:
+        logger.warning(
+            "local %s decision failed (%s); using the hosted fallback "
+            "(local failure %d of %d)",
+            LOCAL_PROVIDER,
+            type(exc).__name__,
+            count,
+            LOCAL_FALLBACK_FAILURE_LIMIT,
+        )
+    else:
+        logger.warning(
+            "local %s decision failed (%s); suppressing the hosted fallback, "
+            "local failure %d exceeds the limit of %d. The local error is "
+            "raised instead. The breaker resets after %d s without a new "
+            "failure, or as soon as a local call succeeds.",
+            LOCAL_PROVIDER,
+            type(exc).__name__,
+            count,
+            LOCAL_FALLBACK_FAILURE_LIMIT,
+            int(LOCAL_FALLBACK_COOLDOWN_SECONDS),
+        )
+    return may_fallback
 
 
 # The hosted providers. They are not renamed by the four-mode contract: the mode

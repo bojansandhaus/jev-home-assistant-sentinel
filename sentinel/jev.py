@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
@@ -110,21 +111,41 @@ LOCAL_PROVIDER = "laya"
 # counter is per process and resets on restart, and any successful local call
 # resets it to zero.
 LOCAL_FALLBACK_FAILURE_LIMIT = 3
+LOCAL_FALLBACK_COOLDOWN_SECONDS = 300.0
 _local_failure_lock = threading.Lock()
 _local_failure_count = 0
+_local_failure_last = None
+
+
+def _decay_locked() -> None:
+    """Reset the breaker if the cooldown has passed. The caller holds the lock."""
+    global _local_failure_count, _local_failure_last
+    if (
+        _local_failure_last is not None
+        and _local_failure_count
+        and time.monotonic() - _local_failure_last >= LOCAL_FALLBACK_COOLDOWN_SECONDS
+    ):
+        _local_failure_count = 0
+        _local_failure_last = None
 
 
 def local_failure_count() -> int:
-    """The consecutive local failures recorded in this process."""
+    """The consecutive local failures recorded in this process.
+
+    Zero once the cooldown has elapsed, so a caller reading the count sees what
+    the breaker will act on.
+    """
     with _local_failure_lock:
+        _decay_locked()
         return _local_failure_count
 
 
 def reset_local_failures() -> None:
     """Clear the local failure counter after a successful local call."""
-    global _local_failure_count
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
         _local_failure_count = 0
+        _local_failure_last = None
 
 
 def note_local_failure(exc: BaseException) -> bool:
@@ -135,16 +156,41 @@ def note_local_failure(exc: BaseException) -> bool:
     below ``LOCAL_FALLBACK_FAILURE_LIMIT``, so the hosted fallback may be
     attempted. ``False`` means the breaker is tripped and the caller must
     re-raise the local error rather than answer it remotely.
+
+    The log line states which of the two happened. It used to say "considering
+    the hosted fallback" unconditionally, before the count was compared against
+    the limit, so a suppressed call logged that it was about to fall back and
+    then did not.
     """
-    global _local_failure_count
-    logger.warning(
-        "local %s decision failed (%s); considering the hosted fallback",
-        LOCAL_PROVIDER,
-        type(exc).__name__,
-    )
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
+        _decay_locked()
         _local_failure_count += 1
-        return _local_failure_count <= LOCAL_FALLBACK_FAILURE_LIMIT
+        _local_failure_last = time.monotonic()
+        count = _local_failure_count
+        may_fallback = count <= LOCAL_FALLBACK_FAILURE_LIMIT
+    if may_fallback:
+        logger.warning(
+            "local %s decision failed (%s); using the hosted fallback "
+            "(local failure %d of %d)",
+            LOCAL_PROVIDER,
+            type(exc).__name__,
+            count,
+            LOCAL_FALLBACK_FAILURE_LIMIT,
+        )
+    else:
+        logger.warning(
+            "local %s decision failed (%s); suppressing the hosted fallback, "
+            "local failure %d exceeds the limit of %d. The local error is "
+            "raised instead. The breaker resets after %d s without a new "
+            "failure, or as soon as a local call succeeds.",
+            LOCAL_PROVIDER,
+            type(exc).__name__,
+            count,
+            LOCAL_FALLBACK_FAILURE_LIMIT,
+            int(LOCAL_FALLBACK_COOLDOWN_SECONDS),
+        )
+    return may_fallback
 
 
 # The confidence question is a ``score`` question, and a score rubric is an

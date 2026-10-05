@@ -202,12 +202,26 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # A local model name is free text, so it is validated here rather
             # than constrained by a list. Only an empty or unusable name is
             # refused, and it is refused before the entry is stored.
-            local_model = user_input.get(LOCAL_MODEL_FIELD)
-            if local_model is not None:
+            # An untouched field must read as "not configured", or `auto` gains a
+            # local hop the operator never asked for: the form pre-fills the
+            # field with the default model name, and `resolve_auto_mode` treats
+            # any non-None `local_model` as an explicit choice. So a value equal
+            # to the default and not typed by the operator is normalised to None
+            # here, and `auto` stays `api_only` exactly as it was in v1.3.0.
+            # Choosing `auto` and doing nothing must not send household cases to
+            # a hosted provider.
+            local_model = (user_input.get(LOCAL_MODEL_FIELD) or "").strip()
+            if local_model == LOCAL_MODEL:
+                local_model = None
+            elif local_model:
                 try:
                     local_checkpoint(local_model)
                 except ValueError:
                     errors[LOCAL_MODEL_FIELD] = "local_model_invalid"
+            if not errors and local_model is None:
+                user_input = {
+                    k: v for k, v in user_input.items() if k != LOCAL_MODEL_FIELD
+                }
             if not errors:
                 return self.async_create_entry(
                     title="Jev Home Assistant Sentinel", data=user_input
@@ -221,7 +235,10 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     ),
                     vol.Optional("api_key", default=""): str,
                     vol.Optional("laya_base_url", default=LAYA_BASE_URL): str,
-                    vol.Optional(LOCAL_MODEL_FIELD, default=LOCAL_MODEL): str,
+                    # Empty by default: a pre-filled name is indistinguishable from an
+                    # explicit choice, and `auto` reads that choice. The label
+                    # still names ``laya`` as the example.
+                    vol.Optional(LOCAL_MODEL_FIELD, default=""): str,
                     # Kept for entries that stored it before ``local_model``
                     # existed. ``local_model`` wins when both are present.
                     vol.Optional("laya_model", default=LAYA_MODEL): str,
