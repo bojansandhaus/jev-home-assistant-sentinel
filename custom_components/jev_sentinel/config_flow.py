@@ -178,7 +178,12 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return OptionsFlowHandler(config_entry)
+        # No argument. Home Assistant sets the flow's `handler`, which is the
+        # entry id, after this returns, and `config_entry` is resolved from it.
+        # On 2025.12 and later `OptionsFlow.__init__` takes no arguments and
+        # `config_entry` is a read-only property, so passing the entry here is
+        # wrong on every version the manifest admits.
+        return OptionsFlowHandler()
 
     async def async_step_user(self, user_input=None):
         errors: dict[str, str] = {}
@@ -238,8 +243,19 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_entry):
-        self.config_entry = config_entry
+    """The options form for an existing entry.
+
+    There is deliberately no ``__init__`` here. `config_entry` comes from the
+    base class: Home Assistant 2025.6 exposed it as a property with a setter
+    marked `breaks_in_ha_version="2025.12"`, the setter was removed in
+    2025.12.0, and in 2026.9.0 the attribute is a read-only property that raises
+    ValueError when `hass` is not yet set. Assigning it in `__init__` therefore
+    raised `AttributeError: property 'config_entry' of 'OptionsFlowHandler'
+    object has no setter` the moment a user opened the options dialog, on every
+    version the manifest admits (`hacs.json` declares `homeassistant: 2026.9.0`).
+    `tests/test_config_flow_options.py` pins the construction against a
+    stand-in base class with the same read-only shape.
+    """
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:

@@ -39,8 +39,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
-from sentinel.redaction import _key_is_secret
-
 logger = logging.getLogger(__name__)
 
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
@@ -314,6 +312,33 @@ def provider_mode(provider: str) -> str:
     if canonical not in PROVIDER_MODES:
         raise ValueError("invalid provider: " + accepted_provider_names())
     return PROVIDER_MODES[canonical]
+
+
+# The credential words a mapping key is matched on, and the key matcher itself.
+# This copy lives here on purpose and is not imported from the repository's
+# `sentinel` package: a HACS install copies only `custom_components/jev_sentinel`,
+# because `hacs.json` sets `content_in_root: false`. An import of `sentinel.` from
+# this file therefore fails at module load on every HACS install, and the
+# integration cannot load at all. Commit 3ff0926 introduced that import and the
+# install broke with it. `tests/test_hacs_install.py` proves the whole component
+# imports with the repository root off `sys.path`, and
+# `tests/test_safety_boundaries.py` keeps the two copies in agreement.
+_SECRET_WORDS = ("token", "password", "secret", "apikey", "credential", "authorization")
+
+
+def _key_is_secret(key: Any) -> bool:
+    """True when a mapping key names a credential.
+
+    Separators and case are normalised first, so `api-key`, `apiKey`, `api key`
+    and `API_KEY` are one word. Matching the raw lowercase key against `api_key`
+    let the other three spellings through and sent those values to the provider
+    in cleartext.
+
+    `Mapping` rather than `dict` is the type checked, so a mapping that is not a
+    dict is redacted on this side too and the two copies cannot drift on it.
+    """
+    normalized = str(key).replace("-", "").replace("_", "").replace(" ", "").lower()
+    return any(word in normalized for word in _SECRET_WORDS)
 
 
 _SECRET_TEXT = re.compile(
@@ -1390,7 +1415,7 @@ def build_provider(
 def redact(value: Any) -> Any:
     if isinstance(value, str):
         return _SECRET_TEXT.sub(r"\1\2[REDACTED]", value)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {
             str(key): ("[REDACTED]" if _key_is_secret(key) else redact(item))
             for key, item in value.items()

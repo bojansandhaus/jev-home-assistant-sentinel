@@ -150,61 +150,93 @@ def _answers_of(questions):
 def test_off_rubric_answer_is_refused_on_the_package_jev_route(monkeypatch):
     provider = pkg.OpenRouterJev("key")
     monkeypatch.setattr(pkg, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(ValueError) as exc:
         provider.decide({})
-    # The refusal must name the offending choice, not merely be an exception.
-    # `pytest.raises(Exception)` also catches AttributeError and friends, so
-    # assert the message carries the actual reason.
-    # The validator names the offending question, not the rejected choice, so
-    # assert on that. The AttributeError guard is what caught the earlier stub
-    # that never reached validation at all.
+    # ValueError, not a bare Exception: the validator raises ValueError, and
+    # `pytest.raises(Exception)` also catches the AttributeError a broken stub
+    # produces. An earlier version of this stub returned the body directly
+    # instead of a context manager, so the provider raised AttributeError
+    # before reaching validation and the test passed on the wrong failure.
+    # The validator names the offending question, not the rejected choice.
     assert "unknown choice for 'outcome'" in str(exc.value), str(exc.value)
-    assert "AttributeError" not in str(exc.value), "stub did not reach the validator"
 
 
 def test_off_rubric_answer_is_refused_on_the_runtime_jev_route(monkeypatch):
     provider = runtime.OpenRouterJev("key")
     monkeypatch.setattr(runtime, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(ValueError) as exc:
         provider.decide({})
-    # The validator names the offending question, not the rejected choice, so
-    # assert on that. The AttributeError guard is what caught the earlier stub
-    # that never reached validation at all.
+    # ValueError, not a bare Exception, so an AttributeError from a broken stub
+    # cannot pass this as a rubric refusal. See the note in the first of these.
     assert "unknown choice for 'outcome'" in str(exc.value), str(exc.value)
-    assert "AttributeError" not in str(exc.value), "stub did not reach the validator"
 
 
 def test_off_rubric_answer_is_refused_on_the_package_laya_route(monkeypatch):
     provider = pkg.LayaJev("http://127.0.0.1:8123/v1/systemone")
     monkeypatch.setattr(pkg, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(ValueError) as exc:
         provider.decide({})
-    # The validator names the offending question, not the rejected choice, so
-    # assert on that. The AttributeError guard is what caught the earlier stub
-    # that never reached validation at all.
+    # ValueError, not a bare Exception, so an AttributeError from a broken stub
+    # cannot pass this as a rubric refusal. See the note in the first of these.
     assert "unknown choice for 'outcome'" in str(exc.value), str(exc.value)
-    assert "AttributeError" not in str(exc.value), "stub did not reach the validator"
 
 
 def test_off_rubric_answer_is_refused_on_the_runtime_laya_route(monkeypatch):
     provider = runtime.LayaJev("http://127.0.0.1:8123/v1/systemone")
     monkeypatch.setattr(runtime, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
-    with pytest.raises(Exception):
+    # ValueError, not a bare Exception: the validator raises ValueError, and a
+    # blind `pytest.raises(Exception)` also passes on the AttributeError a
+    # broken stub produces, which is the failure this file already had once.
+    with pytest.raises(ValueError) as exc:
         provider.decide({})
+    assert "unknown choice for 'outcome'" in str(exc.value), str(exc.value)
 
 
 def test_every_route_refuses_the_same_body():
     """The documented promise is that the rubric applies whatever answered."""
     questions = pkg.decision_questions()
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError) as package_exc:
         pkg.validate_answers(OFF_RUBRIC_BODY["answers"], questions, label="t")
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError) as runtime_exc:
         runtime.validate_answers(OFF_RUBRIC_BODY["answers"], questions, label="t")
+    # The two copies have to refuse identically, not merely both refuse. The
+    # label is the only difference between the two messages.
+    assert str(package_exc.value) == str(runtime_exc.value), (
+        str(package_exc.value),
+        str(runtime_exc.value),
+    )
+    assert "unknown choice for 'outcome'" in str(package_exc.value)
+
+
+# A complete, on-rubric answer set, so the out-of-range score is the only thing
+# wrong with the payload. The questions are `outcome` and `action` (choices) and
+# `confidence` (a score), so a payload carrying only `score` was refused for a
+# missing answer before it was ever checked against the legend.
+VALID_ANSWERS = {
+    "outcome": {"choice": "ignore", "probability": 0.6},
+    "action": {"choice": "notify", "probability": 0.6},
+    "confidence": {"score": 0, "probability": 0.6},
+}
+
+
+def test_a_complete_answer_set_is_accepted():
+    """The baseline the score test needs: this payload is otherwise valid."""
+    questions = pkg.decision_questions()
+    pkg.validate_answers(VALID_ANSWERS, questions, label="t")
+    runtime.validate_answers(VALID_ANSWERS, questions, label="t")
 
 
 def test_an_out_of_range_score_is_refused_not_clamped():
     """`confidence_from_score` used to clamp 99 to 1.0 silently."""
-    with pytest.raises(Exception):
-        pkg.validate_answers(
-            {"score": {"score": 99}}, pkg.decision_questions(), label="t"
-        )
+    questions = pkg.decision_questions()
+    out_of_range = dict(VALID_ANSWERS, confidence={"score": 99, "probability": 0.6})
+    with pytest.raises(ValueError) as package_exc:
+        pkg.validate_answers(out_of_range, questions, label="t")
+    with pytest.raises(ValueError) as runtime_exc:
+        runtime.validate_answers(out_of_range, questions, label="t")
+    # The refusal has to name the score, not a missing answer that was never
+    # reached: this payload is complete, so the only fault left is the index.
+    assert "index 99 is outside the 0 to 4 legend scale" in str(package_exc.value), str(
+        package_exc.value
+    )
+    assert str(package_exc.value) == str(runtime_exc.value)
