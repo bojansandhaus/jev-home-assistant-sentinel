@@ -172,7 +172,7 @@ def test_off_rubric_answer_is_refused_on_the_runtime_jev_route(monkeypatch):
 
 
 def test_off_rubric_answer_is_refused_on_the_package_laya_route(monkeypatch):
-    provider = pkg.LayaJev("http://127.0.0.1:8123/v1/systemone")
+    provider = pkg.LayaJev("http://127.0.0.1:8123")
     monkeypatch.setattr(pkg, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
     with pytest.raises(ValueError) as exc:
         provider.decide({})
@@ -182,7 +182,7 @@ def test_off_rubric_answer_is_refused_on_the_package_laya_route(monkeypatch):
 
 
 def test_off_rubric_answer_is_refused_on_the_runtime_laya_route(monkeypatch):
-    provider = runtime.LayaJev("http://127.0.0.1:8123/v1/systemone")
+    provider = runtime.LayaJev("http://127.0.0.1:8123")
     monkeypatch.setattr(runtime, "urlopen", _StubTransport(OFF_RUBRIC_BODY))
     # ValueError, not a bare Exception: the validator raises ValueError, and a
     # blind `pytest.raises(Exception)` also passes on the AttributeError a

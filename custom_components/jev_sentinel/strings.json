@@ -16,7 +16,8 @@
     },
     "error": {
       "api_key_required": "The modes that reach the hosted API need an OpenRouter API key. Select local_only only when a local decision-model server is running, or Clef when CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set in the environment.",
-      "local_model_invalid": "The local System One decision model name cannot be empty and cannot contain whitespace, a quote, a backslash, or the URL characters ?, #, and &. Use laya, or the engine name of any other local pre-deterministic routing model you run."
+      "local_model_invalid": "The local System One decision model name cannot be empty and cannot contain whitespace, a quote, a backslash, or the URL characters ?, #, and &. Use laya, or the engine name of any other local pre-deterministic routing model you run.",
+      "laya_base_url_invalid": "The local decision-model server URL must be loopback or a private address on your own network, over HTTPS if it is not loopback, and it must carry no path. Set the server root, for example 127.0.0.1:8000, and the /v1/systemone path is appended for you. A public remote host is refused: the local slot holds household case data."
     }
   },
   "options": {

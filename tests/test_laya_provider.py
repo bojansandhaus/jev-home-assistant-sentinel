@@ -248,13 +248,54 @@ def test_the_local_route_refuses_cleartext_to_a_remote_host():
     assert (
         laya_endpoint("http://localhost:8123") == "http://localhost:8123/v1/systemone"
     )
-    assert laya_endpoint("https://laya.example") == "https://laya.example/v1/systemone"
     with pytest.raises(ValueError, match="nonlocal Laya server requires HTTPS"):
         LayaJev("http://192.168.1.10:8000")
     with pytest.raises(ValueError, match="invalid Laya base URL"):
         laya_endpoint("127.0.0.1:8000")
     with pytest.raises(ValueError, match="invalid Laya endpoint path"):
         laya_endpoint(LAYA_BASE_URL, "v1/systemone")
+
+
+def test_the_local_route_accepts_a_private_address_over_https():
+    """The household that runs its local server on another box keeps working.
+
+    A private address is on the household's own network, so the redacted case
+    still holds household data inside the house. This is the case the
+    non-loopback check must not break, and the reason the refusal below is about
+    a *public* host rather than about any host that is not 127.0.0.1.
+    """
+    assert (
+        laya_endpoint("https://192.168.1.10:8000")
+        == "https://192.168.1.10:8000/v1/systemone"
+    )
+    assert laya_endpoint("https://laya.local") == "https://laya.local/v1/systemone"
+    assert (
+        laya_endpoint("https://[fd00::1]:8000") == "https://[fd00::1]:8000/v1/systemone"
+    )
+
+
+def test_a_public_remote_host_is_refused_for_the_local_slot():
+    """``https://evil.example.com`` was accepted unchanged.
+
+    The local slot carries area, entity ids, ``window_open_minutes`` and
+    ``heating_state`` for every case, so an arbitrary remote host in this field
+    posts household case data somewhere the policy never placed it. This
+    assertion replaces an earlier one that accepted a public hostname, which is
+    what made that possible.
+    """
+    for host in ("https://laya.example", "https://evil.example.com", "http://8.8.8.8"):
+        with pytest.raises(ValueError, match="remote Laya host is refused"):
+            laya_endpoint(host)
+
+
+def test_a_base_url_carrying_a_path_is_refused_rather_than_doubled():
+    """``http://127.0.0.1:8000/v1`` produced ``.../v1/v1/systemone``."""
+    with pytest.raises(ValueError, match="carries a path"):
+        laya_endpoint("http://127.0.0.1:8000/v1")
+    with pytest.raises(ValueError, match="carries a path"):
+        laya_endpoint(LAYA_BASE_URL + "/v1/systemone")
+    with pytest.raises(ValueError, match="embedded credentials"):
+        laya_endpoint("https://user:secret@127.0.0.1:8000")
 
 
 def test_the_confidence_rubric_is_an_ordered_list_of_levels():
@@ -1261,20 +1302,29 @@ def test_the_breaker_allows_three_fallbacks_and_suppresses_the_fourth(monkeypatc
 
 def test_a_healthy_local_call_resets_a_tripped_breaker(monkeypatch):
     package = sys.modules["sentinel.jev"]
-    monkeypatch.setattr(package, "_local_failure_count", LOCAL_FALLBACK_FAILURE_LIMIT)
+    # The breaker is per local hop now, so it is tripped through the same door
+    # the chain drives it through, scoped to the endpoint the provider builds.
+    for _ in range(LOCAL_FALLBACK_FAILURE_LIMIT):
+        package.note_local_failure(RuntimeError("tripped earlier"), LOCAL_URL)
+    assert local_failure_count(LOCAL_URL) == LOCAL_FALLBACK_FAILURE_LIMIT
     assert local_failure_count() == LOCAL_FALLBACK_FAILURE_LIMIT
     _capture(monkeypatch, package, _answered())
     provider = build_provider(CHAINED_PROVIDER, api_key="private", env={})
     decision = provider.decide({"case": {"event_type": "manual"}})
     assert decision.raw["provider"] == LOCAL_PROVIDER
+    assert local_failure_count(LOCAL_URL) == 0
     assert local_failure_count() == 0
 
 
 def test_a_local_only_success_also_resets_the_breaker(monkeypatch):
     package = sys.modules["sentinel.jev"]
-    monkeypatch.setattr(package, "_local_failure_count", LOCAL_FALLBACK_FAILURE_LIMIT)
+    # Tripped through the public, per-scope door; the local-only route resets
+    # its own hop's counter, which is the default ``LayaJev()`` endpoint.
+    for _ in range(LOCAL_FALLBACK_FAILURE_LIMIT):
+        package.note_local_failure(RuntimeError("tripped earlier"), LOCAL_URL)
     _capture(monkeypatch, package, _answered())
     LayaJev().decide({"case": {"event_type": "manual"}})
+    assert local_failure_count(LOCAL_URL) == 0
     assert local_failure_count() == 0
 
 

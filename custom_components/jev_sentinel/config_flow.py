@@ -61,8 +61,10 @@ from .runtime import (
     LOCAL_MODEL_FIELD,
     LOCAL_ONLY,
     LOCAL_WITH_API_FALLBACK,
+    laya_endpoint,
     local_checkpoint,
     pins_clef,
+    resolve_auto_mode,
     resolve_provider,
 )
 
@@ -143,10 +145,8 @@ CHECKPOINT_LABELS = {
     "clef-flash": "clef-flash, the smaller and faster checkpoint",
 }
 
-# The modes that reach the hosted API, so they are the modes that need
-# ``api_key`` in this form. A mode that names Clef reads its own credential from
-# the environment instead and is not asked for the stored OpenRouter key, and
-# the local-only mode needs none.
+# The modes that reach the hosted API over the stored OpenRouter key. Clef reads
+# its own credential from the environment, so a Clef-pinned name is not here.
 OPENROUTER_MODES = (
     API_ONLY,
     API_WITH_LOCAL_FALLBACK,
@@ -157,19 +157,36 @@ OPENROUTER_MODES = (
 )
 
 
-def _needs_api_key(provider: str) -> bool:
-    """Whether the stored name reaches the hosted API over the OpenRouter key."""
-    if provider in OPENROUTER_MODES:
-        return True
-    # A name that pins Clef first still needs the hosted key behind Clef, so it
-    # is asked for one exactly as the two-hop chain always has been.
-    if pins_clef(provider):
-        return provider in (
+def _needs_api_key(provider: str, *, local_model: object = None) -> bool:
+    """Whether the stored name reaches the hosted API over the OpenRouter key.
+
+    The gate is keyed off the **resolved** canonical mode, not off the spelling
+    the operator picked, because the two legacy aliases ``laya_with_jev_fallback``
+    and ``laya_then_hosted`` both resolve to ``local_with_api_fallback``, whose
+    provider order raises ``ValueError: missing OPENROUTER_API_KEY``. Reading the
+    spelling instead of the mode let those two names through the form without a
+    key, so the entry saved and every review on it crashed.
+
+    ``auto`` is dynamic — it resolves to ``api_with_local_fallback`` when a local
+    model has been named and to ``api_only`` otherwise — so the local model in
+    the same submission decides it.
+
+    Clef-pinned names are the exception: their hosted side reads
+    ``CLOUDFLARE_API_TOKEN`` and ``CLOUDFLARE_ACCOUNT_ID`` from the environment,
+    so a Clef-first chain needs the stored key only for the hosted hop that sits
+    behind Clef. The three names that have one are named below; ``clef``,
+    ``clef_api``, and ``clef_with_local_fallback`` need nothing from this form.
+    """
+    stored = str(provider or "")
+    if pins_clef(stored):
+        return stored in (
             LOCAL_WITH_API_FALLBACK,
             "clef_with_jev_fallback",
-            "clef_then_jev",
+            CLEF_CHAINED_PROVIDER,
         )
-    return False
+    if stored.strip().lower() == "auto":
+        return resolve_auto_mode(local_model=local_model) in OPENROUTER_MODES
+    return resolve_provider(stored) in OPENROUTER_MODES
 
 
 class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -189,13 +206,14 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             stored = str(user_input.get("provider", DEFAULT_PROVIDER))
-            provider = resolve_provider(stored)
+            local_model = (user_input.get(LOCAL_MODEL_FIELD) or "").strip()
             # Every mode that reaches the hosted API needs a key: ``api_only``
             # calls it directly, and both fallback modes need it behind the
             # first hop. Clef carries its own credential from the environment,
-            # and the local-only mode needs none.
+            # and the local-only mode needs none. The gate reads the resolved
+            # mode, so a legacy alias is asked for exactly what its mode needs.
             if (
-                _needs_api_key(stored)
+                _needs_api_key(stored, local_model=local_model or None)
                 and not str(user_input.get("api_key", "")).strip()
             ):
                 errors["api_key"] = "api_key_required"
@@ -210,7 +228,6 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # here, and `auto` stays `api_only` exactly as it was in v1.3.0.
             # Choosing `auto` and doing nothing must not send household cases to
             # a hosted provider.
-            local_model = (user_input.get(LOCAL_MODEL_FIELD) or "").strip()
             if local_model == LOCAL_MODEL:
                 local_model = None
             elif local_model:
@@ -222,6 +239,18 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 user_input = {
                     k: v for k, v in user_input.items() if k != LOCAL_MODEL_FIELD
                 }
+            # The local slot is where household case data goes, so its URL is
+            # validated here rather than at the first review. A misconfigured
+            # ``laya_base_url`` used to save an entry that crashed every review
+            # on it, or worse, posted the case to a remote host this form had no
+            # reason to allow.
+            if not errors:
+                base_url = str(user_input.get("laya_base_url") or "").strip()
+                if base_url:
+                    try:
+                        laya_endpoint(base_url)
+                    except ValueError as exc:
+                        errors["laya_base_url"] = "laya_base_url_invalid"
             if not errors:
                 return self.async_create_entry(
                     title="Jev Home Assistant Sentinel", data=user_input

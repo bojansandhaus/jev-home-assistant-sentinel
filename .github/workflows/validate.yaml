@@ -9,9 +9,13 @@ on:
 
 jobs:
   validate:
+    # Depends on the test job, for the reason the hassfest workflow gives: a
+    # release that has not passed its own tests is not a validated one.
+    needs: core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: hacs/action@main
+      # Pinned to a commit SHA rather than `main`, which is a mutable ref.
+      - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa
         with:
           category: integration

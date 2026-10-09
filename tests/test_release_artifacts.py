@@ -41,11 +41,51 @@ def test_release_artifacts_exist_and_are_pngs():
 
 
 def test_validation_workflows_use_official_actions():
+    """Third-party actions are pinned to a commit SHA, and the test gate runs.
+
+    ``hassfest@master`` and ``hacs/action@main`` are mutable refs: anyone who
+    can push to either repository changes what validates every pull request in
+    this one, with no change in this repository's history. A full 40-hex SHA
+    cannot be repointed. Neither workflow ran the test suite either, so a merge
+    could be "validated" while its own tests were failing.
+    """
+    import re
+
     hass = (ROOT / ".github/workflows/hassfest.yaml").read_text()
     hacs = (ROOT / ".github/workflows/validate.yaml").read_text()
-    assert "home-assistant/actions/hassfest@master" in hass
-    assert "hacs/action@main" in hacs
+    # The actions are still the official ones, from the official accounts.
+    assert "home-assistant/actions/hassfest@" in hass
+    assert "hacs/action@" in hacs
     assert "category: integration" in hacs
+    # Neither is pinned to a branch, a tag, or a partial SHA.
+    for action, source in (
+        ("home-assistant/actions/hassfest", hass),
+        ("hacs/action", hacs),
+    ):
+        for ref in re.findall(rf"{re.escape(action)}@([^\s]+)", source):
+            assert re.fullmatch(
+                r"[0-9a-f]{40}", ref
+            ), f"{action} is pinned to {ref!r}, which is not a commit SHA"
+    for workflow in (hass, hacs):
+        assert (
+            "@main" not in workflow and "@master" not in workflow
+        ), "a mutable default-branch pin survived"
+    # Both validation jobs depend on the test job rather than running instead of
+    # it. `hacs.json`'s own validation is not a substitute for a green suite.
+    for workflow in (hass, hacs):
+        assert re.search(
+            r"^    needs:\s*core\s*$", workflow, re.M
+        ), "a validation workflow does not depend on the test job"
+    # And the core workflow still runs the suite itself.
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "python -m pytest" in ci, "the core workflow no longer runs the tests"
+    for gate in (
+        "python -m black --check sentinel custom_components tests",
+        "python -m isort --check-only sentinel custom_components tests",
+        "python -m compileall -q sentinel custom_components tests",
+        "git diff --check",
+    ):
+        assert gate in ci, gate
 
 
 def test_translations_offer_every_mode_the_code_accepts():

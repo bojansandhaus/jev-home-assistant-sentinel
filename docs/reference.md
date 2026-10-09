@@ -298,7 +298,9 @@ A repeated local outage must not turn every household case into remote traffic, 
 | Counter past the limit | The fallback is suppressed, a warning is logged, and the local error is re-raised. No hosted request is made. |
 | Any successful local call | Resets the counter to zero, on the chained route and on the local-only route alike. |
 
-The counter is process state, not case state. It is per process and resets on restart, and `local_failure_count()` reports it while `reset_local_failures()` clears it. Both copies of the provider rules carry the same four names, and the drift test asserts the same limit and the same trip behaviour in each.
+The counter is process state, not case state. It is per local hop, not per process: it is keyed by the endpoint the local provider was pointed at, so two config entries that point at two different local servers have two independent breakers, and one entry's dead local server no longer suppresses the other entry's hosted fallback. `local_failure_count()` with no scope reports the total across every live hop as a diagnostic; `local_failure_count(scope)` reports what the breaker actually compares against the limit. `reset_local_failures()` clears every hop, and `reset_local_failures(scope)` clears one.
+
+The cooldown is unchanged and applies per hop: after `LOCAL_FALLBACK_COOLDOWN_SECONDS` without a new failure, that hop's count returns to zero, so a local server that comes back is retried rather than suppressed for the life of the process. Both copies of the provider rules carry the same five names, and the drift test asserts the same limit and the same trip behaviour in each.
 
 The breaker guards the local hop only. It is not applied to a hosted hop leading to another hosted provider, so `clef_with_jev_fallback` falls through on every qualifying failure rather than after three. A hosted provider that is persistently down therefore costs one failed request per hop per review, which is the cost the plain hosted route already carries.
 
@@ -405,29 +407,63 @@ The function compares supplied values. It does not read an entity, poll, retry, 
 
 ## Home Assistant services
 
-The integration registers `jev_sentinel.review` and `jev_sentinel.verify` once per loaded config entry.
+A Home Assistant service is registered once per domain, not once per config
+entry, so the integration registers each service **once** and resolves which
+entry a call is for on every call. Both handlers read `hass.data[jev_sentinel]`
+at call time, so no handler is ever bound to one entry.
 
 ### `jev_sentinel.review`
 
 | Field | Required | Selector | Meaning |
 |---|---:|---|---|
+| `entry_id` | no | text | The config entry whose provider answers. Optional while exactly one entry is loaded, required with more than one. |
 | `event_type` | yes | text | Case event name. |
 | `area` | no | text | Area label. |
 | `entities` | no | entity, multiple | Zero or more Home Assistant entity identifiers. |
 | `facts` | no | object | Bounded case facts. |
 | `requested_action` | no | text | Requested action label. |
 
-The handler calls OpenRouter in an executor job and fires `jev_sentinel_decision` with `case` and `decision` data.
+**Entry selection.** With one entry loaded, a call that names no `entry_id` is
+answered by it. With several, a call that names none is refused rather than
+answered from whichever entry happens to sit first: Home Assistant registers one
+handler per domain, so there is no per-entry handler to address, and an operator
+who added a `local_only` entry beside a hosted one must not have household cases
+routed over the first entry's OpenRouter key. The refusal fires a
+`jev_sentinel_decision` event with `outcome: "unavailable"`, which moves the
+status sensor off `ready`.
+
+**Failure.** A provider that cannot be built — a misconfigured mode, a missing
+key, a `laya_base_url` the policy refuses — no longer escapes the handler. The
+call completes, a `jev_sentinel_decision` event is fired with
+`outcome: "error"`, `error_type`, and `reason`, and the status sensor reads
+`error`. Before this, the exception escaped, no event was fired, and the sensor
+kept the previous value, which on a fresh install is `ready`.
+
+The handler calls the configured provider in an executor job and fires
+`jev_sentinel_decision` with `case`, `decision`, and `entry_id` data.
 
 ### `jev_sentinel.verify`
 
 | Field | Required | Selector | Meaning |
 |---|---:|---|---|
+| `entry_id` | no | text | The config entry this comparison belongs to. |
 | `expected` | yes | text | Expected value supplied by the caller. |
 | `actual` | yes | text | Observed value supplied by the caller. |
 | `available` | no | boolean | Defaults to true. |
 
-The handler fires `jev_sentinel_verification` with the verification dictionary.
+**This is a caller-attested comparison, not a readback.** The service compares
+the two values it is given and fires `jev_sentinel_verification`; it does not
+read an entity, a state machine, or any other Home Assistant source. Its name
+changed from "Record a verification comparison" to spell that out, because the
+old name read as though the service verified something. A readback backed by
+real entity state is the caller's automation, which is what
+`docs/integrations.md` describes.
+
+The `expected` and `actual` fields are plain text selectors, so a caller may put
+any string in either. That is deliberate and is the reason the event carries no
+more authority than the comparison itself: nothing here is tied to real entity
+state, so a `verified: true` in this event attests the two strings, not the
+house.
 
 ## Events
 
@@ -444,7 +480,56 @@ The handler fires `jev_sentinel_verification` with the verification dictionary.
 
 ## Status sensor
 
-Each config entry creates `sensor.<entry_name>_status` with unique ID `jev_sentinel_status`. Its initial native value is `ready`. It listens for `jev_sentinel_decision` and updates to `event.data["decision"]["outcome"]`, falling back to `unknown` when absent. It also listens for `jev_sentinel_verification` and updates to that event's `status`.
+Each config entry creates `sensor.<entry_name>_status` with unique ID `jev_sentinel_status`. Its initial native value is `ready` until the first event arrives. It listens for `jev_sentinel_decision` and updates to `event.data["decision"]["outcome"]`, falling back to `unknown` when absent, and also exposes `action`, `error_type`, `reason`, and `entry_id` as attributes. It also listens for `jev_sentinel_verification` and updates to that event's `status`.
+
+A failed review fires the same decision event with `outcome: "error"`, so the sensor reads `error` rather than keeping a previous value; a call that named no entry while several were loaded fires `outcome: "unavailable"`.
+
+## The authority boundary
+
+`Policy.authorize(action, entity_id, service_data, *, user_approved=None)`
+answers for a whole request, not for an action name, and returns a record of
+what it checked:
+
+| Field | Meaning |
+|---|---|
+| `allowed`, `status`, `reason` | The verdict, as before. |
+| `action`, `entity_id`, `checked_at` | What was checked. |
+| `approval` | Who approved, when, of what, and until when, or `null`. |
+| `field`, `value`, `range` | Present on a `value_out_of_range` refusal. |
+| `restricted_by` | Present when the target entity matched a restricted pattern. |
+
+Three scopes are checked, in this order:
+
+1. **Action** — `allowed_actions` needs no human; `approval_required`
+   (`lock.unlock`, `alarm_control_panel.alarm_disarm`, `cover.open_garage`,
+   `water_valve.close`) needs one every time.
+2. **Entity** — an entity whose id carries a segment matching
+   `restricted_entity_patterns` (`nursery`, `baby`, `infant`, `child`,
+   `blackout`, `incubator`, `medical`, `medication`, `aquarium`, `terrarium`,
+   `vivarium`, `freezer`, `fridge`, `refrigerator`) needs an approval too, so
+   `light.turn_on` on `light.living_room` is allowed and the same action on
+   `light.nursery_blackout` is not. The match is on whole segments, split on
+   every separator at once, so `blackout` is not reached by `out`. A caller may
+   replace the set; an empty set disables the check.
+3. **Service data** — `value_ranges` bounds the parameters of an action. A
+   `climate.set_temperature` whose `temperature`, `target_temp_high`, or
+   `target_temp_low` falls outside 5 to 30 is refused with
+   `value_out_of_range`. This check runs *before* any approval, because an
+   out-of-range value names a request nobody should make and an approval does
+   not make it one somebody should.
+
+**Approvals carry provenance.** `user_approved` accepts an `Approval` record
+(`by`, `at`, `scope`, `expires_at`), a mapping with those keys, or a bare
+boolean for backwards compatibility. `scope` is an action name, an entity id, or
+`action@entity`, and an approval that does not name the request it is offered
+for is refused as `approval_out_of_scope`; `expires_at` produces
+`approval_expired` once it passes, and an unparseable expiry is not a permissive
+one. A bare `True` still works and is recorded as an approval by `"caller"`.
+
+`SentinelWorkflow.execute` reads `entity_id` and `service_data` out of
+`case.facts`, falling back to `decision.raw`, and passes them to the policy. The
+shipped Home Assistant bridge carries the same `execute`, which it used to lack
+entirely.
 
 ## Configuration
 
@@ -454,8 +539,8 @@ The config flow stores `provider`, and the fields for the selected route:
 |---|---:|---|---|
 | `provider` | yes | `openrouter` | The decision mode. `api_only` for the hosted API alone, `local_only` for the local model alone, `api_with_local_fallback` for the hosted API first, `local_with_api_fallback` for the local model first. Every earlier name also selects the same routing: `openrouter`, `jev_api`, `clef`, and `clef_api` are `api_only`; `laya` and `laya_local` are `local_only`; `laya_then_hosted`, `laya_with_jev_fallback`, `clef_then_jev`, and `clef_with_jev_fallback` are `local_with_api_fallback`; `clef_with_local_fallback` is `api_with_local_fallback` with Clef leading; `auto` is the configured hosted providers, adding the local slot only when `local_model` is set. See [the alias table](#the-alias-table). The stored value is not rewritten. |
 | `clef_model` | no | `clef` | The Clef checkpoint: `clef` or `clef-flash`. Applies to the `clef` and `clef_then_jev` routes and is ignored on the others. An unknown value raises `ValueError("invalid Clef checkpoint: ...")`; a stored blank value falls back to the default. |
-| `api_key` | for `api_only`, `api_with_local_fallback`, and `local_with_api_fallback` | empty | The OpenRouter key. Selecting a mode that reaches hosted Jev with an empty key returns the `api_key_required` error. The check runs against the stored name, so `openrouter`, `jev_api`, `laya_then_hosted`, `laya_with_jev_fallback`, and `clef_with_jev_fallback` require a key, while `local_only`, `laya`, `laya_local`, and `clef_api` do not: Clef reads its own credential from the environment and never receives the stored OpenRouter key. |
-| `laya_base_url` | no | `http://127.0.0.1:8000` | The local decision-model server URL, used on `local_only` and on the local hop of both fallback modes. Pointing it at another engine's server is a configuration change, not a code change. |
+| `api_key` | for every mode that reaches hosted Jev | empty | The OpenRouter key. Selecting a mode that reaches hosted Jev with an empty key returns the `api_key_required` error. The check runs against the **resolved** canonical mode, not the stored spelling, so `openrouter`, `jev_api`, `laya_then_hosted`, `laya_with_jev_fallback`, and `clef_with_jev_fallback` all require a key, while `local_only`, `laya`, `laya_local`, `clef`, `clef_api`, and `clef_with_local_fallback` do not: Clef reads its own credential from the environment and never receives the stored OpenRouter key. Reading the stored name instead of the mode used to let `laya_with_jev_fallback` and `laya_then_hosted` save an entry with no key, and every review on it then raised. |
+| `laya_base_url` | no | `http://127.0.0.1:8000` | The local decision-model server URL, used on `local_only` and on the local hop of both fallback modes. Pointing it at another engine's server is a configuration change, not a code change. The host must be loopback or a private address on the household's own network, with HTTPS required for anything that is not loopback; a public remote host is refused, because the local slot carries area, entity ids, and case facts. A URL that already carries a path is refused rather than joined, which used to produce a doubled `/v1/systemone/v1/systemone`. The form reports both as `laya_base_url_invalid`. |
 | `local_model` | no | `laya` | Which local System One decision model answers. Free text, not a list: any local model publishing the same `/v1/systemone` request shape fits, and a model published after this release works by naming it. Rejected only when empty, whitespace-only, not text, or carrying a character that would corrupt a URL path segment or a JSON string, with `ValueError("invalid local_model: ...")` at build time and the `local_model_invalid` error in the form. Known to fit: `laya`, `laya-multilingual`, `laya-typed-decisions`, and any other local pre-deterministic routing model serving that endpoint. **Takes precedence over `laya_model` when it is set.** |
 | `laya_model` | no | `convaiinnovations/laya` | **Deprecated.** The per-model setting kept for backwards compatibility. It is the older spelling of `local_model` and still works on its own, so an entry that stored only `laya_model` keeps calling that checkpoint. When both are present, `local_model` wins. |
 

@@ -40,12 +40,18 @@ class SentinelStatusSensor(SensorEntity):
         )
 
     async def _decision_received(self, event) -> None:
-        self._attr_native_value = event.data.get("decision", {}).get(
-            "outcome", "unknown"
-        )
+        decision = event.data.get("decision", {})
+        # A failed review fires the same event with ``outcome`` set to ``error``
+        # or ``unavailable``. The sensor used to keep its previous value, which
+        # on a fresh install is ``ready``: an operator watching it saw a healthy
+        # integration while every review on it was raising.
+        self._attr_native_value = decision.get("outcome", "unknown")
         self._attr_extra_state_attributes = {
             "event": "decision",
-            "action": event.data.get("decision", {}).get("action"),
+            "action": decision.get("action"),
+            "error_type": decision.get("error_type"),
+            "reason": decision.get("reason"),
+            "entry_id": event.data.get("entry_id"),
         }
         self.async_write_ha_state()
 
