@@ -24,3 +24,46 @@ jobs:
       - run: python -m json.tool hacs.json >/dev/null
       - run: python -m json.tool custom_components/jev_sentinel/manifest.json >/dev/null
       - run: git diff --check
+
+  # A HACS install copies only `custom_components/jev_sentinel`, because
+  # `hacs.json` sets `content_in_root: false`. The `core` job above installs
+  # this package, which makes the repository's own `sentinel` package
+  # importable from anywhere, so a component that depends on it passes there and
+  # fails on every real install. This job runs the two install-boundary tests
+  # without `pip install -e '.[test]'`, so the guarantee is enforced here rather
+  # than only on a maintainer's machine.
+  hacs-install-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # pytest only. The package under test is deliberately not installed, and
+      # the tests build their own isolation: a copied component plus `python -I -S`,
+      # which leaves nothing on the path but the standard library.
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install pytest
+      - run: python -m pytest tests/test_hacs_install.py tests/test_config_flow_options.py -v
+      # The same boundary, spelled as a plain interpreter run so a failure names
+      # the import rather than a test.
+      - name: prove the component imports from a HACS layout
+        run: |
+          set -eu
+          layout="$(mktemp -d)"
+          mkdir -p "$layout/custom_components"
+          cp -r custom_components/jev_sentinel "$layout/custom_components/"
+          rm -rf "$layout/custom_components/jev_sentinel/__pycache__"
+          cd "$layout"
+          python -I -S -c "
+          import importlib.util, sys
+          assert importlib.util.find_spec('sentinel') is None, 'sentinel leaked onto the path'
+          spec = importlib.util.spec_from_file_location(
+              'jev_sentinel_runtime_under_test',
+              'custom_components/jev_sentinel/runtime.py',
+          )
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          print('the component imports from a HACS layout')
+          "

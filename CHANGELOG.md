@@ -253,3 +253,54 @@ allowed them. `tests/test_safety_boundaries.py` (41 tests) fails against v1.4.0.
   injects its `local_model` default, so a user who selected `auto` and touched
   nothing gets a local hop they did not ask for. Same reasoning: a behaviour
   change, not a typo, and it needs its own release note.
+
+
+## Unreleased
+
+Two install-breaking defects, both shipped because no test covered the install
+layout or the Home Assistant options-flow contract.
+
+### Fixed
+
+- **The integration could not load from a HACS install at all.**
+  `custom_components/jev_sentinel/runtime.py` imported
+  `sentinel.redaction._key_is_secret`, and `sentinel/` is declared in
+  `pyproject.toml` as `packages = ["sentinel"]`, so it exists only in a pip
+  install or a source checkout. `hacs.json` sets `content_in_root: false`, so
+  HACS copies only `custom_components/jev_sentinel` and `sentinel/` never
+  arrives. Every install raised `ModuleNotFoundError: No module named
+  'sentinel'` at module load. The regression came from 1.4.1, which replaced a
+  local helper with the cross-package import. `runtime.py` is self contained
+  again: it imports nothing outside the standard library and `homeassistant.*`,
+  and its copy of `_key_is_secret` handles `Mapping` rather than `dict` so it
+  cannot drift from the package copy on that.
+- **The options dialog raised on every supported install.**
+  `OptionsFlowHandler.__init__` assigned `self.config_entry`. Home Assistant
+  2025.6 marked the setter `breaks_in_ha_version="2025.12"` and 2025.12.0
+  removed it, so on 2026.2.0 and 2026.9.0 the assignment raises
+  `AttributeError: property 'config_entry' of 'OptionsFlowHandler' object has no
+  setter` the moment Home Assistant builds the options flow. `hacs.json`
+  declares `homeassistant: 2026.9.0`, so every install the manifest admits hit
+  it. `__init__` is gone and `async_get_options_flow` builds the handler with no
+  argument, which is what the 2026.9.0 base class accepts; `config_entry` is
+  resolved by the base class from `handler`.
+
+### Added
+
+- `tests/test_hacs_install.py`, which copies the component alone into a temporary
+  directory and imports it under `python -I`, so the guarantee holds without
+  `pip install -e '.[test]'` having put `sentinel` on the path.
+- `tests/test_config_flow_options.py`, which constructs `OptionsFlowHandler`
+  against a stand-in base class carrying the real 2026.9.0 `config_entry`
+  property.
+- A `hacs-install-boundary` CI job that runs both without installing the package.
+
+### Changed
+
+- `tests/test_safety_boundaries.py` narrows six bare `pytest.raises(Exception)`
+  to `ValueError`, which is what the validator raises. A blind `Exception` also
+  passes on the `AttributeError` a broken transport stub produces, which is the
+  failure mode this file already had once. `test_an_out_of_range_score_is_refused_not_clamped`
+  also used a payload that was refused for a missing answer rather than for the
+  out-of-range index it claims to test; it now sends a complete answer set with
+  only the score out of range, and asserts the refusal names the index.

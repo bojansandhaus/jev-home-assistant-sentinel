@@ -178,7 +178,12 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @staticmethod
     @callback
     def async_get_options_flow(config_entry):
-        return OptionsFlowHandler(config_entry)
+        # No argument. Home Assistant sets the flow's `handler`, which is the
+        # entry id, after this returns, and `config_entry` is resolved from it.
+        # On 2025.12 and later `OptionsFlow.__init__` takes no arguments and
+        # `config_entry` is a read-only property, so passing the entry here is
+        # wrong on every version the manifest admits.
+        return OptionsFlowHandler()
 
     async def async_step_user(self, user_input=None):
         errors: dict[str, str] = {}
@@ -197,12 +202,26 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # A local model name is free text, so it is validated here rather
             # than constrained by a list. Only an empty or unusable name is
             # refused, and it is refused before the entry is stored.
-            local_model = user_input.get(LOCAL_MODEL_FIELD)
-            if local_model is not None:
+            # An untouched field must read as "not configured", or `auto` gains a
+            # local hop the operator never asked for: the form pre-fills the
+            # field with the default model name, and `resolve_auto_mode` treats
+            # any non-None `local_model` as an explicit choice. So a value equal
+            # to the default and not typed by the operator is normalised to None
+            # here, and `auto` stays `api_only` exactly as it was in v1.3.0.
+            # Choosing `auto` and doing nothing must not send household cases to
+            # a hosted provider.
+            local_model = (user_input.get(LOCAL_MODEL_FIELD) or "").strip()
+            if local_model == LOCAL_MODEL:
+                local_model = None
+            elif local_model:
                 try:
                     local_checkpoint(local_model)
                 except ValueError:
                     errors[LOCAL_MODEL_FIELD] = "local_model_invalid"
+            if not errors and local_model is None:
+                user_input = {
+                    k: v for k, v in user_input.items() if k != LOCAL_MODEL_FIELD
+                }
             if not errors:
                 return self.async_create_entry(
                     title="Jev Home Assistant Sentinel", data=user_input
@@ -216,7 +235,10 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     ),
                     vol.Optional("api_key", default=""): str,
                     vol.Optional("laya_base_url", default=LAYA_BASE_URL): str,
-                    vol.Optional(LOCAL_MODEL_FIELD, default=LOCAL_MODEL): str,
+                    # Empty by default: a pre-filled name is indistinguishable from an
+                    # explicit choice, and `auto` reads that choice. The label
+                    # still names ``laya`` as the example.
+                    vol.Optional(LOCAL_MODEL_FIELD, default=""): str,
                     # Kept for entries that stored it before ``local_model``
                     # existed. ``local_model`` wins when both are present.
                     vol.Optional("laya_model", default=LAYA_MODEL): str,
@@ -238,8 +260,19 @@ class JevSentinelConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_entry):
-        self.config_entry = config_entry
+    """The options form for an existing entry.
+
+    There is deliberately no ``__init__`` here. `config_entry` comes from the
+    base class: Home Assistant 2025.6 exposed it as a property with a setter
+    marked `breaks_in_ha_version="2025.12"`, the setter was removed in
+    2025.12.0, and in 2026.9.0 the attribute is a read-only property that raises
+    ValueError when `hass` is not yet set. Assigning it in `__init__` therefore
+    raised `AttributeError: property 'config_entry' of 'OptionsFlowHandler'
+    object has no setter` the moment a user opened the options dialog, on every
+    version the manifest admits (`hacs.json` declares `homeassistant: 2026.9.0`).
+    `tests/test_config_flow_options.py` pins the construction against a
+    stand-in base class with the same read-only shape.
+    """
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:

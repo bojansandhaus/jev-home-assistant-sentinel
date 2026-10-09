@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -38,8 +39,6 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
-
-from sentinel.redaction import _key_is_secret
 
 logger = logging.getLogger(__name__)
 
@@ -100,26 +99,54 @@ FALLBACK_STATUS_CODES = frozenset({401, 403, 429})
 
 # A repeated local outage must not quietly turn every household case into remote
 # traffic. Three consecutive local failures that qualified for the hosted
-# fallback still fall back; the fourth, and every one after it, is suppressed,
-# the local error is re-raised instead of being answered remotely, and a warning
-# is logged. The counter is per process and resets on restart, and any
-# successful local call resets it to zero.
+# fallback still fall back; the fourth, and every one after it, is suppressed and
+# the local error is re-raised instead of being answered remotely.
+#
+# The breaker is a process global, so two config entries share it: while the
+# household has two entries and only one local server is dead, the healthy entry
+# can be denied its fallback until the process restarts. It now decays. After
+# ``LOCAL_FALLBACK_COOLDOWN_SECONDS`` with no new failure the count returns to
+# zero, so a local server that comes back is retried instead of staying
+# suppressed for the life of the Home Assistant process.
+#
+# A successful local call also resets it immediately.
 LOCAL_FALLBACK_FAILURE_LIMIT = 3
+LOCAL_FALLBACK_COOLDOWN_SECONDS = 300.0
 _local_failure_lock = threading.Lock()
 _local_failure_count = 0
+_local_failure_last: float | None = None
 
 
 def local_failure_count() -> int:
-    """The consecutive local failures recorded in this process."""
+    """The consecutive local failures recorded in this process.
+
+    Returns zero once the cooldown has elapsed, so a caller reading the count
+    sees the same thing the breaker will act on.
+    """
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
+        _decay_locked()
         return _local_failure_count
+
+
+def _decay_locked() -> None:
+    """Reset the breaker if the cooldown has passed. Caller holds the lock."""
+    global _local_failure_count, _local_failure_last
+    if (
+        _local_failure_last is not None
+        and _local_failure_count
+        and time.monotonic() - _local_failure_last >= LOCAL_FALLBACK_COOLDOWN_SECONDS
+    ):
+        _local_failure_count = 0
+        _local_failure_last = None
 
 
 def reset_local_failures() -> None:
     """Clear the local failure counter after a successful local call."""
-    global _local_failure_count
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
         _local_failure_count = 0
+        _local_failure_last = None
 
 
 def note_local_failure(exc: BaseException) -> bool:
@@ -130,16 +157,41 @@ def note_local_failure(exc: BaseException) -> bool:
     below ``LOCAL_FALLBACK_FAILURE_LIMIT``, so the hosted fallback may be
     attempted. ``False`` means the breaker is tripped and the caller must
     re-raise the local error rather than answer it remotely.
+
+    The log line states which of those two happened. It used to say
+    "considering the hosted fallback" unconditionally, before the count was
+    compared against the limit, so a suppressed call logged that it was about to
+    fall back and then did not.
     """
-    global _local_failure_count
-    logger.warning(
-        "local %s decision failed (%s); considering the hosted fallback",
-        LOCAL_PROVIDER,
-        type(exc).__name__,
-    )
+    global _local_failure_count, _local_failure_last
     with _local_failure_lock:
+        _decay_locked()
         _local_failure_count += 1
-        return _local_failure_count <= LOCAL_FALLBACK_FAILURE_LIMIT
+        _local_failure_last = time.monotonic()
+        count = _local_failure_count
+        may_fallback = count <= LOCAL_FALLBACK_FAILURE_LIMIT
+    if may_fallback:
+        logger.warning(
+            "local %s decision failed (%s); using the hosted fallback "
+            "(local failure %d of %d)",
+            LOCAL_PROVIDER,
+            type(exc).__name__,
+            count,
+            LOCAL_FALLBACK_FAILURE_LIMIT,
+        )
+    else:
+        logger.warning(
+            "local %s decision failed (%s); suppressing the hosted fallback, "
+            "local failure %d exceeds the limit of %d. The local error is "
+            "raised instead. The breaker resets after %d s without a new "
+            "failure, or as soon as a local call succeeds.",
+            LOCAL_PROVIDER,
+            type(exc).__name__,
+            count,
+            LOCAL_FALLBACK_FAILURE_LIMIT,
+            int(LOCAL_FALLBACK_COOLDOWN_SECONDS),
+        )
+    return may_fallback
 
 
 # The hosted providers. They are not renamed by the four-mode contract: the mode
@@ -314,6 +366,33 @@ def provider_mode(provider: str) -> str:
     if canonical not in PROVIDER_MODES:
         raise ValueError("invalid provider: " + accepted_provider_names())
     return PROVIDER_MODES[canonical]
+
+
+# The credential words a mapping key is matched on, and the key matcher itself.
+# This copy lives here on purpose and is not imported from the repository's
+# `sentinel` package: a HACS install copies only `custom_components/jev_sentinel`,
+# because `hacs.json` sets `content_in_root: false`. An import of `sentinel.` from
+# this file therefore fails at module load on every HACS install, and the
+# integration cannot load at all. Commit 3ff0926 introduced that import and the
+# install broke with it. `tests/test_hacs_install.py` proves the whole component
+# imports with the repository root off `sys.path`, and
+# `tests/test_safety_boundaries.py` keeps the two copies in agreement.
+_SECRET_WORDS = ("token", "password", "secret", "apikey", "credential", "authorization")
+
+
+def _key_is_secret(key: Any) -> bool:
+    """True when a mapping key names a credential.
+
+    Separators and case are normalised first, so `api-key`, `apiKey`, `api key`
+    and `API_KEY` are one word. Matching the raw lowercase key against `api_key`
+    let the other three spellings through and sent those values to the provider
+    in cleartext.
+
+    `Mapping` rather than `dict` is the type checked, so a mapping that is not a
+    dict is redacted on this side too and the two copies cannot drift on it.
+    """
+    normalized = str(key).replace("-", "").replace("_", "").replace(" ", "").lower()
+    return any(word in normalized for word in _SECRET_WORDS)
 
 
 _SECRET_TEXT = re.compile(
@@ -1390,7 +1469,7 @@ def build_provider(
 def redact(value: Any) -> Any:
     if isinstance(value, str):
         return _SECRET_TEXT.sub(r"\1\2[REDACTED]", value)
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {
             str(key): ("[REDACTED]" if _key_is_secret(key) else redact(item))
             for key, item in value.items()
