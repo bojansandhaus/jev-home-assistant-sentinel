@@ -2,6 +2,17 @@ review:
   name: Review a bounded Home Assistant case with Jev
   description: Ask Jev for a typed recommendation. This service is advisory and does not execute a device action.
   fields:
+    entry_id:
+      name: Config entry
+      description: >-
+        The config entry whose provider answers this call. Optional while exactly
+        one entry is loaded and required with more than one: services are
+        registered once per domain, not once per entry, so an unnamed call cannot
+        be routed on its own. A call that names no entry while several are loaded
+        is refused rather than answered from whichever entry happens to be first.
+      required: false
+      selector:
+        text:
     event_type:
       required: true
       selector:
@@ -20,9 +31,19 @@ review:
       selector:
         text:
 verify:
-  name: Record a verification comparison
-  description: Emit a verification event for a deterministic readback workflow.
+  name: Record a caller-attested readback comparison
+  description: >-
+    Record a comparison you supply yourself. This service does not read Home
+    Assistant state: it compares the expected and actual values you give it and
+    fires jv_sentinel_verification. A readback backed by real entity state is the
+    caller's automation.
   fields:
+    entry_id:
+      name: Config entry
+      description: The config entry this comparison belongs to, when more than one is loaded.
+      required: false
+      selector:
+        text:
     expected:
       required: true
       selector:

@@ -26,6 +26,8 @@ so an existing config entry keeps the routing it stored.
 
 from __future__ import annotations
 
+import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -102,54 +104,71 @@ FALLBACK_STATUS_CODES = frozenset({401, 403, 429})
 # fallback still fall back; the fourth, and every one after it, is suppressed and
 # the local error is re-raised instead of being answered remotely.
 #
-# The breaker is a process global, so two config entries share it: while the
-# household has two entries and only one local server is dead, the healthy entry
-# can be denied its fallback until the process restarts. It now decays. After
-# ``LOCAL_FALLBACK_COOLDOWN_SECONDS`` with no new failure the count returns to
-# zero, so a local server that comes back is retried instead of staying
-# suppressed for the life of the Home Assistant process.
+# The breaker is keyed by the local hop it belongs to rather than held once for
+# the process. It was a process global, so two config entries shared it: while
+# the household had two entries and one local server was dead, the healthy entry
+# could be denied its hosted fallback until Home Assistant restarted, even though
+# its own local server was answering. One entry's outage must not deny another
+# entry the fallback it is configured for.
 #
-# A successful local call also resets it immediately.
+# The counter also decays. After ``LOCAL_FALLBACK_COOLDOWN_SECONDS`` with no new
+# failure the count for that hop returns to zero, so a local server that comes
+# back is retried instead of staying suppressed for the life of the Home
+# Assistant process. A successful local call also resets it immediately.
+#
+# The default scope is the empty string, which is what a caller that builds one
+# provider and never names it gets, and which behaves exactly as one shared
+# breaker did.
 LOCAL_FALLBACK_FAILURE_LIMIT = 3
 LOCAL_FALLBACK_COOLDOWN_SECONDS = 300.0
 _local_failure_lock = threading.Lock()
-_local_failure_count = 0
-_local_failure_last: float | None = None
+_local_failures: dict[str, list[float]] = {}
 
 
-def local_failure_count() -> int:
-    """The consecutive local failures recorded in this process.
+def _decay_locked(scope: str, now: float) -> None:
+    """Reset one breaker if the cooldown has passed. Caller holds the lock."""
+    stamps = _local_failures.get(scope)
+    if stamps and now - stamps[-1] >= LOCAL_FALLBACK_COOLDOWN_SECONDS:
+        _local_failures.pop(scope, None)
 
-    Returns zero once the cooldown has elapsed, so a caller reading the count
-    sees the same thing the breaker will act on.
+
+def local_failure_count(scope: str | None = None) -> int:
+    """The consecutive local failures recorded for one local hop.
+
+    Zero once the cooldown has elapsed, so a caller reading the count sees the
+    same thing the breaker will act on.
+
+    A caller that names a scope gets that hop's count, which is what the breaker
+    compares against the limit. A caller that names none gets the total across
+    every live hop, which is a diagnostic for a process-level question ("is
+    anything local failing right now?") and is deliberately not the number that
+    actuates anything.
     """
-    global _local_failure_count, _local_failure_last
+    now = time.monotonic()
     with _local_failure_lock:
-        _decay_locked()
-        return _local_failure_count
+        if scope is None:
+            for live in list(_local_failures):
+                _decay_locked(live, now)
+            return sum(len(stamps) for stamps in _local_failures.values())
+        _decay_locked(scope, now)
+        return len(_local_failures.get(scope, ()))
 
 
-def _decay_locked() -> None:
-    """Reset the breaker if the cooldown has passed. Caller holds the lock."""
-    global _local_failure_count, _local_failure_last
-    if (
-        _local_failure_last is not None
-        and _local_failure_count
-        and time.monotonic() - _local_failure_last >= LOCAL_FALLBACK_COOLDOWN_SECONDS
-    ):
-        _local_failure_count = 0
-        _local_failure_last = None
+def reset_local_failures(scope: str | None = None) -> None:
+    """Clear one local failure counter after a successful local call.
 
-
-def reset_local_failures() -> None:
-    """Clear the local failure counter after a successful local call."""
-    global _local_failure_count, _local_failure_last
+    A caller that names a scope clears that hop, which is what a successful local
+    call does. A caller that names none clears every hop, which is what clearing
+    the one process-global counter used to mean and what a restart means.
+    """
     with _local_failure_lock:
-        _local_failure_count = 0
-        _local_failure_last = None
+        if scope is None:
+            _local_failures.clear()
+        else:
+            _local_failures.pop(scope, None)
 
 
-def note_local_failure(exc: BaseException) -> bool:
+def note_local_failure(exc: BaseException, scope: str = "") -> bool:
     """Record one failed local attempt and say whether the hosted hop may answer.
 
     Only the exception class name is logged. The case, the entity state, and the
@@ -163,12 +182,18 @@ def note_local_failure(exc: BaseException) -> bool:
     compared against the limit, so a suppressed call logged that it was about to
     fall back and then did not.
     """
-    global _local_failure_count, _local_failure_last
+    now = time.monotonic()
     with _local_failure_lock:
-        _decay_locked()
-        _local_failure_count += 1
-        _local_failure_last = time.monotonic()
-        count = _local_failure_count
+        _decay_locked(scope, now)
+        stamps = _local_failures.setdefault(scope, [])
+        stamps.append(now)
+        # The list is a cooldown book, not a history: a failure older than the
+        # cooldown belongs to an outage that has already been forgotten, and it
+        # must not push a live hop over the limit.
+        cutoff = now - LOCAL_FALLBACK_COOLDOWN_SECONDS
+        while len(stamps) > 1 and stamps[0] < cutoff:
+            stamps.pop(0)
+        count = len(stamps)
         may_fallback = count <= LOCAL_FALLBACK_FAILURE_LIMIT
     if may_fallback:
         logger.warning(
@@ -1014,15 +1039,72 @@ class ClefJev:
 def laya_endpoint(
     base_url: str = LAYA_BASE_URL, endpoint_path: str = LAYA_ENDPOINT_PATH
 ) -> str:
-    """Resolve a local Laya server URL, refusing cleartext to a remote host."""
+    """Resolve a local Laya server URL.
+
+    The local slot is a slot *on this machine* by default: a host that is not
+    loopback is refused unless it is a private or link-local address, because
+    ``https://evil.example.com`` was accepted here unchanged and every
+    redacted-but-still-descriptive case — area, entity ids,
+    ``window_open_minutes``, ``heating_state`` — would then be posted to an
+    arbitrary remote host. A private address stays allowed over HTTPS for the
+    household that runs its local server on another box on its own network; a
+    public one does not, because nothing in this form gives that host a reason
+    to know about the household's windows.
+
+    A ``base_url`` that already carries a path is refused rather than joined to
+    it: ``http://127.0.0.1:8000/v1`` produced
+    ``http://127.0.0.1:8000/v1/v1/systemone``, which no server answers and which
+    reads in the log as a working endpoint.
+    """
     if not endpoint_path.startswith("/"):
         raise ValueError("invalid Laya endpoint path")
-    parsed = urlsplit(base_url)
+    parsed = urlsplit(str(base_url or "").strip())
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("invalid Laya base URL")
-    if parsed.scheme == "http" and parsed.hostname not in _LOOPBACK_HOSTS:
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError(
+            "invalid Laya base URL: "
+            + str(base_url)
+            + " carries a path, which is doubled onto "
+            + LAYA_ENDPOINT_PATH
+            + ". Set the server root and let the endpoint path be appended."
+        )
+    if parsed.username or parsed.password:
+        # The endpoint this returns is the string a request is made against and
+        # the string that appears in a log line, so a credential placed inside
+        # the URL would be carried into both. A local server that needs a bearer
+        # token takes it from ``LAYA_API_KEY`` instead.
+        raise ValueError(
+            "invalid Laya base URL: "
+            + str(base_url)
+            + " carries embedded credentials, which the endpoint and every log"
+            " line built from it would then repeat. Set LAYA_API_KEY instead."
+        )
+    host = parsed.hostname
+    if host not in _LOOPBACK_HOSTS and not _is_private_host(host):
+        raise ValueError(
+            "a remote Laya host is refused: "
+            + str(base_url)
+            + " is neither loopback nor a private address. The local slot holds"
+            " household case data, which this policy will not post to a host it"
+            " cannot place on the household's own network."
+        )
+    if parsed.scheme == "http" and host not in _LOOPBACK_HOSTS:
         raise ValueError("nonlocal Laya server requires HTTPS")
     return base_url.rstrip("/") + endpoint_path
+
+
+def _is_private_host(host: str) -> bool:
+    """Whether a host is a private or link-local address of the household."""
+    candidate = host.strip("[]")
+    if candidate.endswith(".local"):
+        # An mDNS name resolves on the local network and nowhere else.
+        return True
+    try:
+        packed = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return packed.is_private or packed.is_loopback or packed.is_link_local
 
 
 class LayaJev:
@@ -1080,8 +1162,20 @@ class LayaJev:
         decision = decision_from_body(body, model=self.model)
         # A successful local call clears the consecutive-failure count, on the
         # local-only route and on the local hop of the chained route alike.
-        reset_local_failures()
+        reset_local_failures(self.endpoint)
         return decision
+
+
+def _local_scope(provider: Any) -> str:
+    """The breaker scope of one local hop: the endpoint it was pointed at.
+
+    Two config entries usually point at two different local servers, and a
+    dead server takes its own entry's breaker down with it, not the others'. The
+    endpoint is the identity that separates them, so it is the scope. A provider
+    with no endpoint is a caller that never named one and keeps the shared
+    default scope, which is what the process-global counter used to be.
+    """
+    return str(getattr(provider, "endpoint", "") or "")
 
 
 def is_fallback_trigger(exc: BaseException) -> bool:
@@ -1132,7 +1226,7 @@ class ChainedJev:
                         # API. The breaker guards the local hop only: a hosted
                         # hop in front of another hosted provider is bounded by
                         # the order, not by a counter.
-                        if note_local_failure(exc):
+                        if note_local_failure(exc, _local_scope(provider)):
                             continue
                         logger.warning(
                             "hosted fallback suppressed after %d consecutive"
@@ -1524,26 +1618,380 @@ def redact(value: Any) -> Any:
     return value
 
 
-class Policy:
-    allowed_actions = frozenset(
-        {
-            "notify",
-            "ask_user",
-            "light.turn_on",
-            "light.turn_off",
-            "switch.turn_on",
-            "switch.turn_off",
-            "climate.set_temperature",
+ALLOWED_ACTIONS = frozenset(
+    {
+        "notify",
+        "ask_user",
+        "light.turn_on",
+        "light.turn_off",
+        "switch.turn_on",
+        "switch.turn_off",
+        "climate.set_temperature",
+    }
+)
+
+# The actions that move a lock, a valve, or a garage, or silence an alarm. A
+# human decides these, every time, whoever asks.
+APPROVAL_REQUIRED = frozenset(
+    {
+        "lock.unlock",
+        "alarm_control_panel.alarm_disarm",
+        "cover.open_garage",
+        "water_valve.close",
+    }
+)
+
+# Entity identifiers that name a consequence this policy will not assume on its
+# own. The match is by segment of the entity id, so ``light.nursery_blackout``
+# matches ``nursery`` and ``light.living_room`` does not. A match does not refuse
+# the action; it requires an approval that covers this request, exactly as the
+# ``approval_required`` names do.
+RESTRICTED_ENTITY_PATTERNS = frozenset(
+    {
+        "nursery",
+        "baby",
+        "infant",
+        "child",
+        "blackout",
+        "incubator",
+        "medical",
+        "medication",
+        "aquarium",
+        "terrarium",
+        "vivarium",
+        "freezer",
+        "fridge",
+        "refrigerator",
+    }
+)
+
+# The inclusive numeric bounds for a parameter of an action, in the unit Home
+# Assistant sends it in. ``climate.set_temperature`` had no bounds at all, which
+# is how an AI decision of 40 C on a nursery climate was authorized with no
+# approval. A value outside its range is refused: it names a request nobody
+# should make, and an approval cannot make it one somebody should.
+VALUE_RANGES: Mapping[str, Mapping[str, tuple[float, float]]] = {
+    "climate.set_temperature": {
+        "temperature": (5.0, 30.0),
+        "target_temp_high": (5.0, 30.0),
+        "target_temp_low": (5.0, 30.0),
+    },
+}
+
+
+# The separators an entity id is built from. A restricted-pattern match is a
+# whole-segment match, so this is the one place the segments of a name are
+# decided.
+_SEGMENT_SEPARATOR = re.compile(r"[^0-9a-z]+")
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class Approval:
+    """Who approved which request, and when.
+
+    ``by`` is the identity that approved and ``scope`` the request it approved:
+    an action name, an entity id, or ``action@entity``. ``None`` approves
+    anything the action itself permits, which is what an unrestricted approval
+    means. ``expires_at`` is the ISO 8601 instant after which the approval is no
+    longer one; an approval that has outlived its window is refused rather than
+    honoured, because a decision made for one moment is not authority for the
+    next.
+    """
+
+    by: str
+    scope: str | tuple[str, ...] | None = None
+    at: str = field(default_factory=_utcnow)
+    expires_at: str | None = None
+
+    @staticmethod
+    def coerce(
+        value: "Approval | Mapping[str, Any] | bool | None",
+    ) -> "Approval | None":
+        """Read an approval from a record, a mapping, a bare boolean, or nothing.
+
+        A bare ``True`` still works, because that is what callers passed before
+        the record existed. It is recorded as an approval by ``"caller"`` with
+        no scope and no expiry, which is the least provenance the value can
+        carry while remaining a boolean.
+        """
+        if value is None or value is False:
+            return None
+        if isinstance(value, Approval):
+            return value
+        if isinstance(value, Mapping):
+            by = str(value.get("by") or value.get("approved_by") or "caller")
+            scope = value.get("scope")
+            if isinstance(scope, (list, tuple)):
+                scope = tuple(str(item) for item in scope)
+            elif scope is not None:
+                scope = str(scope)
+            return Approval(
+                by=by,
+                scope=scope,
+                at=str(value.get("at") or value.get("approved_at") or _utcnow()),
+                expires_at=(
+                    str(value["expires_at"])
+                    if value.get("expires_at") is not None
+                    else None
+                ),
+            )
+        if value is True:
+            return Approval(by="caller")
+        return None
+
+    def covers(self, action: str, entity_id: str | None) -> bool:
+        """Whether this approval names this request explicitly."""
+        if self.scope is None:
+            return True
+        scopes = (self.scope,) if isinstance(self.scope, str) else tuple(self.scope)
+        candidates = [action]
+        if entity_id:
+            candidates.extend([entity_id, f"{action}@{entity_id}"])
+        return any(candidate in scopes for candidate in candidates)
+
+    def expired(self, *, now: datetime | None = None) -> bool:
+        if self.expires_at is None:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        try:
+            until = datetime.fromisoformat(self.expires_at)
+        except ValueError:
+            # An unparseable expiry is not a permissive one.
+            return True
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return moment >= until
+
+    def to_dict(self) -> dict[str, Any]:
+        """The provenance recorded alongside the authorization decision."""
+        return {
+            "by": self.by,
+            "at": self.at,
+            "scope": (
+                list(self.scope) if isinstance(self.scope, tuple) else self.scope
+            ),
+            "expires_at": self.expires_at,
         }
+
+
+@dataclass(frozen=True)
+class Policy:
+    """Allow only declared, bounded, reversible actions unless a human approves.
+
+    The policy answers for one request at a time: the action, the entity it
+    targets, and the service data it carries. Every refusal carries the scope
+    that refused it, so an operator reading the event bus sees what was checked
+    rather than a verdict with no reasons attached.
+    """
+
+    allowed_actions: frozenset[str] = ALLOWED_ACTIONS
+    approval_required: frozenset[str] = APPROVAL_REQUIRED
+    # Replaceable by a caller whose household has entities the default set does
+    # not name. An empty set disables the entity check entirely.
+    restricted_entity_patterns: frozenset[str] = RESTRICTED_ENTITY_PATTERNS
+    value_ranges: Mapping[str, Mapping[str, tuple[float, float]]] = field(
+        default_factory=lambda: dict(VALUE_RANGES)
     )
 
-    def authorize(self, action: str | None) -> bool:
-        return action in self.allowed_actions
+    def authorize(
+        self,
+        action: str | None,
+        entity_id: str | None = None,
+        service_data: Mapping[str, Any] | None = None,
+        *,
+        user_approved: "Approval | Mapping[str, Any] | bool | None" = None,
+    ) -> dict[str, object]:
+        """Answer for one request, and record what was checked."""
+        approval = Approval.coerce(user_approved)
+        checked: dict[str, object] = {
+            "action": action,
+            "entity_id": entity_id,
+            "checked_at": _utcnow(),
+        }
+        if not action:
+            return self._refusal(
+                "no_action",
+                "No action was proposed.",
+                checked,
+                approval,
+            )
+        if action not in self.allowed_actions and action not in self.approval_required:
+            return self._refusal(
+                "not_allowlisted",
+                "Action is not in the Sentinel policy.",
+                checked,
+                approval,
+            )
+        # The value range is checked before any approval, because an
+        # out-of-range parameter is a request nobody should make and an approval
+        # does not make it one somebody should.
+        out_of_range = self._out_of_range(action, service_data)
+        if out_of_range is not None:
+            name, (low, high), value = out_of_range
+            return self._refusal(
+                "value_out_of_range",
+                f"{name} {value} is outside the {low} to {high} range the"
+                f" policy permits for {action}.",
+                {**checked, "field": name, "value": value, "range": [low, high]},
+                approval,
+            )
+        restricted = self._restricted_entity(entity_id)
+        if restricted is not None:
+            if approval is None:
+                return self._refusal(
+                    "approval_required",
+                    f"{entity_id} names a restricted entity ({restricted}) and"
+                    " this policy will not change it without an approval.",
+                    {**checked, "restricted_by": restricted},
+                    approval,
+                )
+            if approval.expired():
+                return self._refusal(
+                    "approval_expired",
+                    f"The approval for {entity_id} expired at"
+                    f" {approval.expires_at}.",
+                    {**checked, "restricted_by": restricted},
+                    approval,
+                )
+            if not approval.covers(action, entity_id):
+                return self._refusal(
+                    "approval_out_of_scope",
+                    f"The approval by {approval.by} does not name {action} on"
+                    f" {entity_id}.",
+                    {**checked, "restricted_by": restricted},
+                    approval,
+                )
+        if action in self.approval_required:
+            if approval is None:
+                return self._refusal(
+                    "approval_required",
+                    "This action needs explicit user approval.",
+                    checked,
+                    approval,
+                )
+            if approval.expired():
+                return self._refusal(
+                    "approval_expired",
+                    f"The approval expired at {approval.expires_at}.",
+                    checked,
+                    approval,
+                )
+            if not approval.covers(action, entity_id):
+                return self._refusal(
+                    "approval_out_of_scope",
+                    f"The approval by {approval.by} does not name {action} on"
+                    f" {entity_id}.",
+                    checked,
+                    approval,
+                )
+        return {
+            "allowed": True,
+            "status": "approved",
+            "reason": "Policy allows this action.",
+            "approval": approval.to_dict() if approval is not None else None,
+            **checked,
+        }
+
+    # -- internals -------------------------------------------------------
+
+    def _refusal(
+        self,
+        status: str,
+        reason: str,
+        checked: dict[str, object],
+        approval: Approval | None,
+    ) -> dict[str, object]:
+        return {
+            "allowed": False,
+            "status": status,
+            "reason": reason,
+            "approval": approval.to_dict() if approval is not None else None,
+            **checked,
+        }
+
+    def _restricted_entity(self, entity_id: str | None) -> str | None:
+        """The pattern a target entity matches, if any.
+
+        The entity id is split on every separator at once and each segment is
+        compared whole, so ``light.nursery_blackout`` is restricted and
+        ``light.living_room`` is not, and no pattern can be reached by a
+        substring of a longer word.
+        """
+        if not entity_id or not self.restricted_entity_patterns:
+            return None
+        # Split on every separator at once. Splitting on one at a time gives
+        # ``light.nursery_room`` the segments ``light``, ``nursery_room``,
+        # ``light.nursery``, and ``room`` — never ``nursery``, which is the one
+        # the policy is looking for.
+        segments = {
+            part.lower() for part in _SEGMENT_SEPARATOR.split(str(entity_id)) if part
+        }
+        # Sorted, so the pattern reported in a refusal is the same one every
+        # time. An unordered set made the reason code an implementation detail
+        # of whichever pattern the interpreter reached first.
+        for pattern in sorted(self.restricted_entity_patterns):
+            if pattern.lower() in segments:
+                return pattern
+        return None
+
+    def _out_of_range(
+        self, action: str, service_data: Mapping[str, Any] | None
+    ) -> tuple[str, tuple[float, float], Any] | None:
+        """The first parameter of this action that is outside its range."""
+        if not service_data:
+            return None
+        ranges = self.value_ranges.get(action)
+        if not ranges:
+            return None
+        for name, (low, high) in ranges.items():
+            if name not in service_data:
+                continue
+            value = service_data[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if not low <= float(value) <= high:
+                return name, (low, high), value
+        return None
+
+
+# The case fields a review targets. A decision that names an entity and service
+# data is the decision the policy can answer for, so the workflow reads them out
+# of the case rather than authorizing a bare action name.
+ENTITY_FIELD = "entity_id"
+SERVICE_DATA_FIELD = "service_data"
+
+
+def _target(case: Case, decision: Decision) -> tuple[str | None, dict[str, Any] | None]:
+    """The entity and service data a decision asks for.
+
+    Both are read from the case first, because that is where an automation puts
+    the request it actually made, and from the decision's ``raw`` payload second,
+    because a provider that answered with a specific entity is the only thing
+    that knows it. Neither source is trusted: whatever is found is passed
+    through the policy, which decides for itself.
+    """
+    facts = case.facts or {}
+    entity = facts.get(ENTITY_FIELD)
+    if entity is None:
+        entity = decision.raw.get(ENTITY_FIELD)
+    entity = str(entity) if entity else None
+    service_data = facts.get(SERVICE_DATA_FIELD)
+    if service_data is None:
+        service_data = decision.raw.get(SERVICE_DATA_FIELD)
+    if not isinstance(service_data, Mapping):
+        service_data = None
+    return entity, dict(service_data) if service_data is not None else None
 
 
 class SentinelWorkflow:
     def __init__(
-        self, provider: OpenRouterJev | LayaJev, policy: Policy | None = None
+        self,
+        provider: Any,
+        policy: "Policy | None" = None,
     ) -> None:
         self.provider = provider
         self.policy = policy or Policy()
@@ -1555,6 +2003,98 @@ class SentinelWorkflow:
                 "allowed_actions": sorted(self.policy.allowed_actions),
             }
         )
+
+    def execute(
+        self,
+        case: Case,
+        decision: Decision,
+        dispatch: Callable[[str], Any],
+        readback: Callable[[], Any],
+        *,
+        user_approved: "Approval | Mapping[str, Any] | bool | None" = None,
+    ) -> dict[str, Any]:
+        """Authorize, dispatch, and verify one bounded case.
+
+        The Home Assistant bridge carried ``review`` alone, so an integration
+        built against it had no authorize step at all and every action it
+        dispatched was authorized by the caller's own judgement. The workflow
+        below is the same one ``sentinel.workflow`` carries, adapted to this
+        module's ``verify``, which returns a mapping rather than a dataclass.
+        """
+        if decision.shadow:
+            authorization = {
+                "allowed": False,
+                "status": "shadow_only",
+                "reason": "Shadow decisions are recommendations and cannot be dispatched.",
+            }
+        else:
+            entity_id, service_data = _target(case, decision)
+            authorization = self.policy.authorize(
+                decision.action,
+                entity_id,
+                service_data,
+                user_approved=user_approved,
+            )
+        result: dict[str, Any] = {
+            "case": case.to_dict(),
+            "decision": decision.to_dict(),
+            "authorization": authorization,
+        }
+        if not authorization["allowed"]:
+            result["verification"] = verify(
+                case.facts.get("expected_state"), None, available=False
+            )
+            return result
+        try:
+            dispatch_result = dispatch(decision.action or "")
+        except Exception as exc:  # the caller receives a safe, structured failure
+            result["dispatch"] = {"status": "error", "error_type": type(exc).__name__}
+            result["verification"] = {
+                "verified": False,
+                "status": "dispatch_failed",
+                "next_step": "notify_and_retry",
+            }
+            return result
+        # An awaitable result means the dispatcher was async. In Home Assistant
+        # every service call is, so this was the ordinary case rather than the
+        # exotic one: the call returned a coroutine, this code recorded
+        # `{"status": "sent", "result_type": "coroutine"}`, the coroutine was
+        # garbage-collected without ever being awaited, and the device never
+        # moved. The readback then compared the state the device was already in
+        # and closed the case as a successfully verified action that physically
+        # did not happen.
+        #
+        # A synchronous boundary cannot honour an awaitable, so it refuses
+        # rather than reporting success. Escalating to an async caller is the
+        # fix, and refusing is what makes that visible.
+        if inspect.isawaitable(dispatch_result):
+            if hasattr(dispatch_result, "close"):
+                dispatch_result.close()  # do not leave a never-awaited coroutine
+            result["dispatch"] = {
+                "status": "unsupported_dispatch",
+                "result_type": "awaitable",
+            }
+            result["verification"] = {
+                "verified": False,
+                "status": "dispatch_not_performed",
+                "next_step": "notify_and_retry",
+            }
+            return result
+        result["dispatch"] = {
+            "status": "sent",
+            "result_type": type(dispatch_result).__name__,
+        }
+        try:
+            actual = readback()
+            result["verification"] = verify(case.facts.get("expected_state"), actual)
+        except Exception as exc:
+            result["verification"] = {
+                "verified": False,
+                "status": "readback_failed",
+                "error_type": type(exc).__name__,
+                "next_step": "reopen_case",
+            }
+        return result
 
 
 def verify(expected: Any, actual: Any, *, available: bool = True) -> dict[str, Any]:

@@ -21,6 +21,7 @@ that answered to ``Decision.raw``. Nothing here imports Hermes internals.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -107,48 +108,72 @@ LOCAL_PROVIDER = "laya"
 # traffic, which is the privacy property this repository exists to protect.
 # Three consecutive local failures that qualified for the hosted fallback still
 # fall back; the fourth, and every one after it, is suppressed, the local error
-# is re-raised instead of being answered remotely, and a warning is logged. The
-# counter is per process and resets on restart, and any successful local call
-# resets it to zero.
+# is re-raised instead of being answered remotely, and a warning is logged. Any
+# successful local call resets the counter for that hop to zero.
+#
+# The counter is keyed by the local hop it belongs to, not held once for the
+# process. It was one module-level pair of globals, which made the breaker a
+# *shared* breaker: with two config entries loaded, three failures on the first
+# entry's dead local server suppressed the second entry's hosted fallback too,
+# for the life of the process, even though the second entry's local server was
+# alive. One entry's outage must not deny another entry the fallback it is
+# configured for, so the scope of a count is the local endpoint that failed.
+#
+# It also decays: after ``LOCAL_FALLBACK_COOLDOWN_SECONDS`` with no new failure
+# the count for that hop returns to zero, so a local server that comes back is
+# retried rather than suppressed until the process restarts. The default scope
+# is the empty string, which is what a caller that builds one provider and never
+# names it gets, and which behaves exactly as one shared breaker did.
 LOCAL_FALLBACK_FAILURE_LIMIT = 3
 LOCAL_FALLBACK_COOLDOWN_SECONDS = 300.0
 _local_failure_lock = threading.Lock()
-_local_failure_count = 0
-_local_failure_last = None
+_local_failures: dict[str, list[float]] = {}
 
 
-def _decay_locked() -> None:
-    """Reset the breaker if the cooldown has passed. The caller holds the lock."""
-    global _local_failure_count, _local_failure_last
-    if (
-        _local_failure_last is not None
-        and _local_failure_count
-        and time.monotonic() - _local_failure_last >= LOCAL_FALLBACK_COOLDOWN_SECONDS
-    ):
-        _local_failure_count = 0
-        _local_failure_last = None
+def _decay_locked(scope: str, now: float) -> None:
+    """Reset one breaker if the cooldown has passed. The caller holds the lock."""
+    stamps = _local_failures.get(scope)
+    if stamps and now - stamps[-1] >= LOCAL_FALLBACK_COOLDOWN_SECONDS:
+        _local_failures.pop(scope, None)
 
 
-def local_failure_count() -> int:
-    """The consecutive local failures recorded in this process.
+def local_failure_count(scope: str | None = None) -> int:
+    """The consecutive local failures recorded for one local hop.
 
     Zero once the cooldown has elapsed, so a caller reading the count sees what
     the breaker will act on.
+
+    A caller that names a scope gets that hop's count, which is what the breaker
+    compares against the limit. A caller that names none gets the total across
+    every live hop, which is a diagnostic for a process-level question ("is
+    anything local failing right now?") and is deliberately not the number that
+    actuates anything.
+    """
+    now = time.monotonic()
+    with _local_failure_lock:
+        if scope is None:
+            for live in list(_local_failures):
+                _decay_locked(live, now)
+            return sum(len(stamps) for stamps in _local_failures.values())
+        _decay_locked(scope, now)
+        return len(_local_failures.get(scope, ()))
+
+
+def reset_local_failures(scope: str | None = None) -> None:
+    """Clear one local failure counter after a successful local call.
+
+    A caller that names a scope clears that hop, which is what a successful local
+    call does. A caller that names none clears every hop, which is what clearing
+    the one process-global counter used to mean and what a restart means.
     """
     with _local_failure_lock:
-        _decay_locked()
-        return _local_failure_count
+        if scope is None:
+            _local_failures.clear()
+        else:
+            _local_failures.pop(scope, None)
 
 
-def reset_local_failures() -> None:
-    """Clear the local failure counter after a successful local call."""
-    global _local_failure_count, _local_failure_last
-    with _local_failure_lock:
-        _local_failure_count = 0
-        _local_failure_last = None
-
-
-def note_local_failure(exc: BaseException) -> bool:
+def note_local_failure(exc: BaseException, scope: str = "") -> bool:
     """Record one failed local attempt and say whether the hosted hop may answer.
 
     Only the exception class name is logged. The case, the entity state, and the
@@ -162,12 +187,18 @@ def note_local_failure(exc: BaseException) -> bool:
     the limit, so a suppressed call logged that it was about to fall back and
     then did not.
     """
-    global _local_failure_count, _local_failure_last
+    now = time.monotonic()
     with _local_failure_lock:
-        _decay_locked()
-        _local_failure_count += 1
-        _local_failure_last = time.monotonic()
-        count = _local_failure_count
+        _decay_locked(scope, now)
+        stamps = _local_failures.setdefault(scope, [])
+        stamps.append(now)
+        # The list is a cooldown book, not a history: a failure older than the
+        # cooldown belongs to an outage that has already been forgotten, and it
+        # must not push a live hop over the limit.
+        cutoff = now - LOCAL_FALLBACK_COOLDOWN_SECONDS
+        while len(stamps) > 1 and stamps[0] < cutoff:
+            stamps.pop(0)
+        count = len(stamps)
         may_fallback = count <= LOCAL_FALLBACK_FAILURE_LIMIT
     if may_fallback:
         logger.warning(
@@ -449,15 +480,72 @@ class OpenRouterJev:
 def laya_endpoint(
     base_url: str = LAYA_BASE_URL, endpoint_path: str = LAYA_ENDPOINT_PATH
 ) -> str:
-    """Resolve a local Laya server URL, refusing cleartext to a remote host."""
+    """Resolve a local Laya server URL.
+
+    The local slot is a slot *on this machine* by default: a host that is not
+    loopback is refused unless it is a private or link-local address, because
+    ``https://evil.example.com`` was accepted here unchanged and every
+    redacted-but-still-descriptive case — area, entity ids,
+    ``window_open_minutes``, ``heating_state`` — would then be posted to an
+    arbitrary remote host. A private address stays allowed over HTTPS for the
+    household that runs its local server on another box on its own network; a
+    public one does not, because nothing in this form gives that host a reason
+    to know about the household's windows.
+
+    A ``base_url`` that already carries a path is refused rather than joined to
+    it: ``http://127.0.0.1:8000/v1`` produced
+    ``http://127.0.0.1:8000/v1/v1/systemone``, which no server answers and which
+    reads in the log as a working endpoint.
+    """
     if not endpoint_path.startswith("/"):
         raise ValueError("invalid Laya endpoint path")
-    parsed = urlsplit(base_url)
+    parsed = urlsplit(str(base_url or "").strip())
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError("invalid Laya base URL")
-    if parsed.scheme == "http" and parsed.hostname not in _LOOPBACK_HOSTS:
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError(
+            "invalid Laya base URL: "
+            + str(base_url)
+            + " carries a path, which is doubled onto "
+            + LAYA_ENDPOINT_PATH
+            + ". Set the server root and let the endpoint path be appended."
+        )
+    if parsed.username or parsed.password:
+        # The endpoint this returns is the string a request is made against and
+        # the string that appears in a log line, so a credential placed inside
+        # the URL would be carried into both. A local server that needs a bearer
+        # token takes it from ``LAYA_API_KEY`` instead.
+        raise ValueError(
+            "invalid Laya base URL: "
+            + str(base_url)
+            + " carries embedded credentials, which the endpoint and every log"
+            " line built from it would then repeat. Set LAYA_API_KEY instead."
+        )
+    host = parsed.hostname
+    if host not in _LOOPBACK_HOSTS and not _is_private_host(host):
+        raise ValueError(
+            "a remote Laya host is refused: "
+            + str(base_url)
+            + " is neither loopback nor a private address. The local slot holds"
+            " household case data, which this policy will not post to a host it"
+            " cannot place on the household's own network."
+        )
+    if parsed.scheme == "http" and host not in _LOOPBACK_HOSTS:
         raise ValueError("nonlocal Laya server requires HTTPS")
     return base_url.rstrip("/") + endpoint_path
+
+
+def _is_private_host(host: str) -> bool:
+    """Whether a host is a private or link-local address of the household."""
+    candidate = host.strip("[]")
+    if candidate.endswith(".local"):
+        # An mDNS name resolves on the local network and nowhere else.
+        return True
+    try:
+        packed = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return packed.is_private or packed.is_loopback or packed.is_link_local
 
 
 def clef_checkpoint(model: str | None = None) -> str:
@@ -829,8 +917,20 @@ class LayaJev:
         decision = decision_from_body(body, model=self.model)
         # A successful local call clears the consecutive-failure count, on the
         # local-only route and on the local hop of the chained route alike.
-        reset_local_failures()
+        reset_local_failures(self.endpoint)
         return decision
+
+
+def _local_scope(provider: Any) -> str:
+    """The breaker scope of one local hop: the endpoint it was pointed at.
+
+    Two config entries usually point at two different local servers, and a
+    dead server takes its own entry's breaker down with it, not the others'. The
+    endpoint is the identity that separates them, so it is the scope. A provider
+    with no endpoint is a caller that never named one and keeps the shared
+    default scope, which is what the process-global counter used to be.
+    """
+    return str(getattr(provider, "endpoint", "") or "")
 
 
 def is_fallback_trigger(exc: BaseException) -> bool:
@@ -881,7 +981,7 @@ class ChainedJev:
                         # API. The breaker guards the local hop only: a hosted
                         # hop in front of another hosted provider is bounded by
                         # the order, not by a counter.
-                        if note_local_failure(exc):
+                        if note_local_failure(exc, _local_scope(provider)):
                             continue
                         logger.warning(
                             "hosted fallback suppressed after %d consecutive"

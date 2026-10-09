@@ -42,7 +42,7 @@ from .jev import (
     validate_score_answer,
 )
 from .models import Case, Decision, Verification
-from .policy import Policy
+from .policy import Approval, Policy
 from .providers import (
     API_ONLY,
     API_WITH_LOCAL_FALLBACK,
@@ -123,6 +123,7 @@ __all__ = [
     "ClefJev",
     "Decision",
     "LayaJev",
+    "Approval",
     "OpenRouterJev",
     "Policy",
     "SentinelWorkflow",

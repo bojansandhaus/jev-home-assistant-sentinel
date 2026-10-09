@@ -3,13 +3,41 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 from .models import Case, Decision, Verification
-from .policy import Policy
+from .policy import Approval, Policy
 from .redaction import redact
 from .verifier import verify
+
+# The case fields a review targets. A decision that names an entity and service
+# data is the decision the policy can answer for, so the workflow reads them out
+# of the case rather than authorizing a bare action name.
+ENTITY_FIELD = "entity_id"
+SERVICE_DATA_FIELD = "service_data"
+
+
+def _target(case: "Case", decision: "Decision") -> tuple[str | None, dict | None]:
+    """The entity and service data a decision asks for.
+
+    Both are read from the case first, because that is where an automation puts
+    the request it actually made, and from the decision's ``raw`` payload second,
+    because a provider that answered with a specific entity is the only thing
+    that knows it. Neither source is trusted: whatever is found is passed
+    through the policy, which decides for itself.
+    """
+    facts = case.facts or {}
+    entity = facts.get(ENTITY_FIELD)
+    if entity is None:
+        entity = decision.raw.get(ENTITY_FIELD)
+    entity = str(entity) if entity else None
+    service_data = facts.get(SERVICE_DATA_FIELD)
+    if service_data is None:
+        service_data = decision.raw.get(SERVICE_DATA_FIELD)
+    if not isinstance(service_data, Mapping):
+        service_data = None
+    return entity, dict(service_data) if service_data is not None else None
 
 
 class DecisionProvider(Protocol):
@@ -48,8 +76,12 @@ class SentinelWorkflow:
                 "reason": "Shadow decisions are recommendations and cannot be dispatched.",
             }
         else:
+            entity_id, service_data = _target(case, decision)
             authorization = self.policy.authorize(
-                decision.action, user_approved=user_approved
+                decision.action,
+                entity_id,
+                service_data,
+                user_approved=user_approved,
             )
         result: dict[str, Any] = {
             "case": case.to_dict(),
