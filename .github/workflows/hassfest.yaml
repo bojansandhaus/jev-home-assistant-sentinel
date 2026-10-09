@@ -9,12 +9,19 @@ on:
 
 jobs:
   validate:
-    # The test suite is the gate: hassfest runs the official validation, and a
-    # merge that fails a test has not been validated at all. Pinned to a commit
-    # SHA so `push` cannot silently change what validates, which is the mutable
-    # default-branch pin this workflow carried before.
-    needs: core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # The test suite is the gate, so this workflow runs it rather than trusting
+      # that some other workflow did. GitHub's `needs` cannot cross workflow
+      # files, so a `needs: core` here names a job that does not exist in this
+      # file and the workflow fails at validation — which is exactly what
+      # happened the first time this release tried it.
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest
+      # Pinned to a commit SHA rather than `master`, a mutable default-branch
+      # ref that anyone who can push to that repository can repoint.
       - uses: home-assistant/actions/hassfest@06749dd8c0b54f350bc69c8752456cee498808a3

@@ -26,7 +26,7 @@ are in [docs/release-notes.md](docs/release-notes.md).
 
 ### Changed
 
-- **CI no longer pins third-party actions to mutable refs, and the validation jobs depend on the test job.** `home-assistant/actions/hassfest@master` and `hacs/action@main` were both pins that whoever can push to either repository can repoint; both are now full 40-hex commit SHAs, and both `hassfest.yaml` and `validate.yaml` declare `needs: core`, so a merge that fails its own tests is not a validated one.
+- **CI no longer pins third-party actions to mutable refs, and the validation workflows run the test suite.** `home-assistant/actions/hassfest@master` and `hacs/action@main` were both pins that whoever can push to either repository can repoint; both are now full 40-hex commit SHAs, and both `hassfest.yaml` and `validate.yaml` run `python -m pytest`, so a merge that fails its own tests is not a validated one. A `needs: core` in a separate workflow file cannot work — GitHub's `needs` cannot cross workflow files, and this release's own first attempt failed at validation for exactly that reason.
 - **`jeve_sentinel.verify` is renamed and documented as a caller-attested comparison.** Its fields were plain `text:` selectors with no entity selector, so `verify` accepted arbitrary caller-supplied strings as "expected"/"actual" with no link to real entity state. The service is now "Record a caller-attested readback comparison", and its description and the reference say plainly that the event attests two strings, not the house, and that a readback backed by real entity state is the caller's automation.
 - **`hass.data[DOMAIN]` stores the entry object rather than a copy of its data,** so a handler resolving an entry by id gets the entry that carries `.data` and `.entry_id`.
 

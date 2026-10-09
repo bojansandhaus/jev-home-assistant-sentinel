@@ -157,9 +157,18 @@ with no change in this repository's history. Neither workflow ran the test suite
 either, so a merge could be "validated" while its own tests were failing.
 
 **What changed.** Both actions are pinned to full 40-hex commit SHAs and both
-validation jobs now declare `needs: core`, so a release that has not passed its
-own tests is not a validated one. `ci.yml` already ran `pytest`; it continues to,
-alongside `black`, `isort`, `compileall`, `json.tool`, and `git diff --check`.
+validation workflows now run the test suite themselves, so a release that has
+not passed its own tests is not a validated one. `ci.yml` already ran `pytest`;
+it continues to, alongside `black`, `isort`, `compileall`, `json.tool`, and
+`git diff --check`.
+
+`needs: core` was the first attempt and it is worth recording why it is not the
+answer: GitHub's `needs` cannot name a job in a different workflow file, so
+`hassfest.yaml` with `needs: core` names a job that does not exist in it, and
+the workflow fails at validation with no job ever started — which is what
+happened, twice, in this release's own CI before this paragraph was written.
+Running the suite in place is the only form of that dependency the
+hassfest and HACS workflows can carry.
 
 `tests/test_release_artifacts.py` asserted the *old* pinned strings
 (`hassfest@master`, `hacs/action@main`), which is the assertion that made pinning

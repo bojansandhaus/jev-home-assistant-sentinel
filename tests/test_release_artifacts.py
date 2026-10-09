@@ -70,12 +70,14 @@ def test_validation_workflows_use_official_actions():
         assert (
             "@main" not in workflow and "@master" not in workflow
         ), "a mutable default-branch pin survived"
-    # Both validation jobs depend on the test job rather than running instead of
-    # it. `hacs.json`'s own validation is not a substitute for a green suite.
-    for workflow in (hass, hacs):
-        assert re.search(
-            r"^    needs:\s*core\s*$", workflow, re.M
-        ), "a validation workflow does not depend on the test job"
+    # Both validation workflows run the test suite themselves. A `needs: core`
+    # here would not work: GitHub's `needs` cannot name a job in a different
+    # workflow file, so the hassfest and HACS workflows failed at validation the
+    # first time this release tried it. Running the suite in place is the only
+    # form of that dependency these workflows can carry.
+    for name, workflow in (("hassfest.yaml", hass), ("validate.yaml", hacs)):
+        assert "python -m pytest" in workflow, name
+        assert "setup-python" in workflow, name
     # And the core workflow still runs the suite itself.
     ci = (ROOT / ".github/workflows/ci.yml").read_text()
     assert "python -m pytest" in ci, "the core workflow no longer runs the tests"

@@ -9,13 +9,18 @@ on:
 
 jobs:
   validate:
-    # Depends on the test job, for the reason the hassfest workflow gives: a
-    # release that has not passed its own tests is not a validated one.
-    needs: core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned to a commit SHA rather than `main`, which is a mutable ref.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # The same gate the hassfest workflow runs, for the same reason: a merge
+      # that fails its own tests is not a validated one. `hacs/action` checks the
+      # repository's HACS metadata, not its behaviour.
+      - run: python -m pip install -e '.[test]'
+      - run: python -m pytest
+      # Pinned to a commit SHA rather than `main`, a mutable ref.
       - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa
         with:
           category: integration
