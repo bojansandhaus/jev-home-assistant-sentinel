@@ -7,6 +7,26 @@ All notable changes to this project are documented here. The format follows
 The full release notes, including the limitations and the verification performed,
 are in [docs/release-notes.md](docs/release-notes.md).
 
+## [1.5.0]
+
+### Security
+
+- **A readback that returned nothing was reported as a successful readback.** `verifier.verify` compared its two arguments and closed the case on equality, so `verify(None, None)` returned `{'verified': True, 'status': 'matched', 'next_step': 'close_case'}`. A case built without an explicit `expected_state` had no verification requirement at all, and an entity renamed or removed between dispatch and readback made the readback `None` too. A device action was closed as successfully verified with zero state readback performed. Neither side being known is now reported as `no_expectation` or `unavailable`.
+- **An async dispatcher was recorded as sent, and the device never moved.** `SentinelWorkflow.execute` accepted any callable, so a Home Assistant async service call returned a coroutine, was recorded `{'status': 'sent', 'result_type': 'coroutine'}`, was collected without being awaited, and the device never moved — while the readback closed the case as verified. Awaitable results are now refused as `unsupported_dispatch` with `dispatch_not_performed`. Exposure is documented integrators via `docs/integrations.md:66`; the shipped integration itself does not dispatch, which `docs/faq.md:5` already states.
+- **Redaction missed nine credential spellings and every structured form.** `_key_is_secret` matched six words as substrings against a flattened key, so `private_key`, `access_key`, `key`, `passwd`, `passphrase`, `authorisation`, `cookie`, `clientid` and `bearer` carried their values to the provider and onto the event bus in cleartext. The string pattern required the colon to follow the word immediately, so every JSON form passed through, and `bearer` was absent from it entirely. Keys are now widened and matched on segments — `private_key` is a secret, `door_pin` is not — and the string branch allows a quoted value and masks `Bearer <token>`. A prose form was tried and removed: it also matched `the api key is stored in the vault`, which names no credential and which the suite already pinned as pass-through.
+
+### Fixed
+
+- **All three fixes land in both copies of the safety layer.** `sentinel/` and `custom_components/jev_sentinel/runtime.py` each carry their own verifier and redactor; the shipped copy is the one Home Assistant loads. A regression test asserting the two agree failed the moment the first copy was fixed, which is the failure mode `tests/test_safety_boundaries.py:66` exists to guard. The new tests run against both.
+
+### Added
+
+- `tests/test_fail_closed_regressions.py`, 33 tests: the verifier's four states and the shipped copy, the async refusal with the coroutine closed, the synchronous and raising dispatchers still behaving, twelve credential spellings, four credential string forms, six household keys and one prose sentence left alone, all against both implementations.
+
+### Known issues
+
+- `runtime.py`'s `Policy` carries no `approval_required` set, so `lock.unlock` is reported there as "not allowlisted" rather than "approval required" — the same refusal under a different reason code. A further divergence between the two copies of the layer.
+
 ## [1.4.0]
 
 ### Added

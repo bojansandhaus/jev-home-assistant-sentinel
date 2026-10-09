@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -66,6 +67,29 @@ class SentinelWorkflow:
             result["dispatch"] = {"status": "error", "error_type": type(exc).__name__}
             result["verification"] = Verification(
                 "dispatch_failed", False, next_step="notify_and_retry"
+            ).to_dict()
+            return result
+        # An awaitable result means the dispatcher was async. In Home Assistant
+        # every service call is, so this was the ordinary case rather than the
+        # exotic one: the call returned a coroutine, this code recorded
+        # `{"status": "sent", "result_type": "coroutine"}`, the coroutine was
+        # garbage-collected without ever being awaited, and the device never
+        # moved. The readback then compared the state the device was already in
+        # and closed the case as a successfully verified action that physically
+        # did not happen.
+        #
+        # A synchronous boundary cannot honour an awaitable, so it refuses
+        # rather than reporting success. Escalating to an async caller is the
+        # fix, and refusing is what makes that visible.
+        if inspect.isawaitable(dispatch_result):
+            if hasattr(dispatch_result, "close"):
+                dispatch_result.close()  # do not leave a never-awaited coroutine
+            result["dispatch"] = {
+                "status": "unsupported_dispatch",
+                "result_type": "awaitable",
+            }
+            result["verification"] = Verification(
+                "dispatch_not_performed", False, next_step="notify_and_retry"
             ).to_dict()
             return result
         result["dispatch"] = {

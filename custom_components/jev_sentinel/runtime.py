@@ -379,6 +379,33 @@ def provider_mode(provider: str) -> str:
 # `tests/test_safety_boundaries.py` keeps the two copies in agreement.
 _SECRET_WORDS = ("token", "password", "secret", "apikey", "credential", "authorization")
 
+# Segments, not substrings. `private_key` yields the segment `key` while
+# `door_pin` yields `pin`, and a door's PIN code is household data this policy
+# is allowed to see. Substring matching cannot tell the two apart, because
+# `doorpin` contains `pin` exactly as `privatekey` contains `key`.
+_SECRET_SEGMENTS = frozenset(
+    {
+        "key",
+        "keys",
+        "passwd",
+        "passphrase",
+        "authorisation",
+        "authorisations",
+        "bearer",
+        "cookie",
+        "clientid",
+        "sessionid",
+        "otp",
+        "signature",
+        "privatekey",
+        "accesskey",
+        "secretkey",
+        "apikey",
+        "authtoken",
+        "refreshtoken",
+    }
+)
+
 
 def _key_is_secret(key: Any) -> bool:
     """True when a mapping key names a credential.
@@ -390,14 +417,28 @@ def _key_is_secret(key: Any) -> bool:
 
     `Mapping` rather than `dict` is the type checked, so a mapping that is not a
     dict is redacted on this side too and the two copies cannot drift on it.
+
+    The key is split into segments as well as flattened. Flattening alone missed
+    `private_key`, `access_key`, `key`, `passwd`, `passphrase`, `authorisation`,
+    `cookie`, `clientid` and `bearer` -- nine spellings that carried their values
+    onto the wire and onto the event bus in cleartext.
     """
     normalized = str(key).replace("-", "").replace("_", "").replace(" ", "").lower()
-    return any(word in normalized for word in _SECRET_WORDS)
+    if any(word in normalized for word in _SECRET_WORDS):
+        return True
+    segments = [s for s in re.split(r"[^A-Za-z0-9]+", str(key).lower()) if s]
+    return any(segment in _SECRET_SEGMENTS for segment in segments)
 
 
 _SECRET_TEXT = re.compile(
-    r"(?i)(api[_ -]?key|token|password|secret|credential)(\s*[:=]\s*)[^\s,;]+"
+    r"(?i)(api[_ -]?key|token|passwd|passphrase|password|secret|credential"
+    r"|authorisation?|bearer|cookie)([\"']?\s*[:=]\s*[\"']?)[^\s,;]+"
 )
+
+# `Authorization: Bearer sk-live-...` and the bare form. Applied before
+# _SECRET_TEXT, whose wider value match would otherwise consume the word
+# `Bearer` and leave the token itself behind it.
+_BEARER_TEXT = re.compile(r"(?i)\b(bearer)(\s+)[A-Za-z0-9._~+/=-]+")
 
 # The confidence question is a ``score`` question, and a score rubric is an
 # ordered list of level descriptions with index 0 first. A local Laya server
@@ -1468,7 +1509,9 @@ def build_provider(
 
 def redact(value: Any) -> Any:
     if isinstance(value, str):
-        return _SECRET_TEXT.sub(r"\1\2[REDACTED]", value)
+        return _SECRET_TEXT.sub(
+            r"\1\2[REDACTED]", _BEARER_TEXT.sub(r"\1\2[REDACTED]", value)
+        )
     if isinstance(value, Mapping):
         return {
             str(key): ("[REDACTED]" if _key_is_secret(key) else redact(item))
@@ -1519,6 +1562,19 @@ def verify(expected: Any, actual: Any, *, available: bool = True) -> dict[str, A
         return {
             "verified": False,
             "status": "unavailable",
+            "expected": expected,
+            "actual": actual,
+            "next_step": "notify_and_retry",
+        }
+    # Neither side being known is not a match. A case built without an
+    # expectation and an entity whose readback returned nothing compared equal
+    # and closed the case as a successfully verified device action with no state
+    # readback performed.
+    if expected is None or actual is None:
+        unreadable = expected is None
+        return {
+            "verified": False,
+            "status": "no_expectation" if unreadable else "unavailable",
             "expected": expected,
             "actual": actual,
             "next_step": "notify_and_retry",
